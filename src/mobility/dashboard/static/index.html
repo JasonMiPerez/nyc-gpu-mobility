@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Explore historical NYC taxi activity, interpretable trip patterns, and measured CPU/GPU performance from a validated published snapshot."
+    />
+    <meta name="color-scheme" content="light" />
+    <title>NYC Mobility Observatory</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="plotly.min.js" defer></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">Skip to results</a>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">NYC</div>
+          <div><strong>Mobility</strong><span>OBSERVATORY</span></div>
+        </div>
+        <p class="brand-caption">Recorded trips. Measured compute.</p>
+        <nav class="navigation" aria-label="Dashboard sections">
+          <button data-page="overview" aria-current="page">
+            <span>01</span>Overview
+          </button>
+          <button data-page="patterns"><span>02</span>Mobility patterns</button>
+          <button data-page="zones">
+            <span>03</span>Zones &amp; connections
+          </button>
+          <button data-page="anomalies"><span>04</span>Unusual activity</button>
+          <button data-page="performance">
+            <span>05</span>CPU &amp; GPU performance
+          </button>
+          <button data-page="methods"><span>06</span>Data &amp; methods</button>
+        </nav>
+        <div class="sidebar-footer">
+          <span class="eyebrow">SOURCE SNAPSHOT</span>
+          <p class="snapshot-id" id="snapshot-id">Loading…</p>
+          <span class="badge" id="data-kind">Published results</span>
+          <p class="muted">Read-only public snapshot</p>
+        </div>
+      </aside>
+      <main id="main-content" class="main-content" tabindex="-1">
+        <header class="page-header">
+          <div>
+            <p class="eyebrow">NEW YORK CITY / HISTORICAL ANALYTICS</p>
+            <h1 id="page-title">Overview</h1>
+            <p class="subtitle" id="page-subtitle">
+              A measured view of recorded movement.
+            </p>
+          </div>
+          <span class="period-pill" id="period-pill"></span>
+        </header>
+        <div id="source-notice"></div>
+        <section class="filters" id="filters" aria-label="Overview filters">
+          <div class="filter-date">
+            <label for="start-date">From · NYC local date</label
+            ><input type="date" id="start-date" />
+          </div>
+          <div class="filter-date">
+            <label for="end-date">Through · inclusive</label
+            ><input type="date" id="end-date" />
+          </div>
+          <div class="filter-zones">
+            <label for="zone-select">Taxi zone</label
+            ><select id="zone-select">
+              <option value="all">All zones</option>
+            </select>
+          </div>
+          <div class="filter-actions">
+            <button class="button primary" id="apply">Apply filters</button
+            ><button class="button secondary" id="reset">Reset</button>
+          </div>
+          <div id="filter-message" class="filter-message" role="status">
+            Filters apply to daily activity and the zone map.
+          </div>
+        </section>
+        <div class="view-controls" id="view-controls"></div>
+        <div id="page-content" aria-live="polite">
+          <div class="notice">Loading the published aggregate snapshot…</div>
+        </div>
+        <footer class="page-footer">
+          <span>NYC TLC source data · America/New_York source local time</span
+          ><span
+            >Recorded activity does not represent all citywide travel.</span
+          >
+        </footer>
+      </main>
+    </div>
+    <noscript
+      ><p>
+        This interactive snapshot requires JavaScript. The source manifests and
+        aggregate JSON files are available in the data directory.
+      </p></noscript
+    >
+  </body>
+</html>

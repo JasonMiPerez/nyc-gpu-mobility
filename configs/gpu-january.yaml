@@ -1,0 +1,11 @@
+data:
+  dataset: yellow
+  year: 2024
+  months: [1]
+processing:
+  backend: gpu
+  batch_rows: 250000
+  gpu_memory_fraction: 0.65
+  custom_cuda: true
+# This run checks the complete CUDA/cuDF/cuML path on a real month.
+# January does not contain the later calibration and test periods.

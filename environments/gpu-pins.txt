@@ -1,0 +1,9 @@
+python 3.12.*
+cudf 25.10.*
+cuml 25.10.*
+cupy 13.6.*
+scikit-learn 1.7.2
+cuda-version 12.2.*
+cuda-nvrtc 12.2.*
+cuda-nvcc 12.2.*
+cuda-sanitizer-api 12.2.*

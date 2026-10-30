@@ -1,0 +1,10 @@
+.git
+.venv
+.browsers
+data
+artifacts
+public-site
+public-preview
+**/__pycache__
+.pytest_cache
+.env

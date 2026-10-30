@@ -1,0 +1,38 @@
+schema_version: 1
+time_policy: nyc_local_wall_time_v1
+data:
+  dataset: yellow
+  year: 2024
+  months: [1, 2, 3, 4, 5, 6]
+processing:
+  backend: cpu
+  batch_rows: 250000
+  gpu_memory_fraction: 0.65
+  allow_missing_sources: false
+splits:
+  train_start: 2024-01-01
+  train_end: 2024-04-01
+  calibration_start: 2024-04-01
+  calibration_end: 2024-05-01
+  test_start: 2024-05-01
+  test_end: 2024-07-01
+clustering:
+  k_values: [4, 6, 8]
+  training_max_rows: 200000
+  evaluation_max_rows: 2000
+  seed: 42
+anomalies:
+  min_history: 8
+  scale_floor: 5.0
+  score_threshold: 4.0
+  absolute_threshold: 20
+benchmark:
+  warmups: 2
+  repeats: 7
+  max_rows: 1000000
+  cpu_threads: 4
+  seed: 42
+dashboard:
+  max_flows: 200
+  max_points: 5000
+  max_export_rows: 50000
