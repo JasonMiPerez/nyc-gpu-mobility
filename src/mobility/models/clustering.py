@@ -19,9 +19,12 @@ from .common import (
     FEATURE_NAMES,
     ML_EXCLUSION_RULES,
     HashSample,
+    PopulationScaler,
+    PrioritySample,
     canonical_batches,
     feature_matrix,
     in_period,
+    initial_center_indices,
     ml_filter_parameters,
     ml_row_masks,
     split_bounds,
@@ -66,9 +69,11 @@ def _sync(backend: str) -> None:
         cp.cuda.get_current_stream().synchronize()
 
 
-def _fit_model(matrix: np.ndarray, k: int, seed: int, backend: str):
+def _fit_model(matrix: np.ndarray, k: int, seed: int, backend: str, initial_centers=None):
     # Identical explicit starting centers make subsequent backend comparisons useful.
-    centers, _ = kmeans_plusplus(matrix, n_clusters=k, random_state=seed)
+    centers = initial_centers
+    if centers is None:
+        centers, _ = kmeans_plusplus(matrix, n_clusters=k, random_state=seed)
     parameters = dict(
         n_clusters=k, init=centers, n_init=1, max_iter=300, tol=1e-4, random_state=seed
     )
@@ -108,6 +113,11 @@ def _evaluate(model, matrix: np.ndarray, backend: str) -> dict:
 
 
 def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: str = "cpu") -> dict:
+    native = config.get("processing", {}).get("execution_mode", "legacy") == "native"
+    if native and backend == "gpu":
+        from .gpu_clustering import fit_clusters_gpu
+
+        return fit_clusters_gpu(canonical_dir, config, output_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     parameters = config.get("clustering", {})
@@ -120,10 +130,15 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
     bounds = split_bounds(config)
     batch_rows = int(config.get("processing", {}).get("batch_rows", 250_000))
     evaluation_limit = min(5000, int(parameters.get("evaluation_max_rows", 2000)))
+    sampler = PrioritySample if native else HashSample
+
+    def matrix_for(frame):
+        return feature_matrix(frame, np.float64 if native else np.float32)
+
     samples = {
-        "train": HashSample(int(parameters.get("training_max_rows", 200_000)), seed),
-        "calibration": HashSample(evaluation_limit, seed),
-        "test": HashSample(evaluation_limit, seed),
+        "train": sampler(int(parameters.get("training_max_rows", 200_000)), seed),
+        "calibration": sampler(evaluation_limit, seed),
+        "test": sampler(evaluation_limit, seed),
     }
     total_rows = 0
     canonical_eligible_rows = 0
@@ -146,8 +161,31 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
         "backend": backend,
         "feature_names": FEATURE_NAMES,
         "feature_dtype": "float32",
-        "feature_version": "log_distance_duration_local_hour_v1",
-        "preprocessing_backend": "CPU: numpy and sklearn StandardScaler",
+        "feature_version": "log_distance_duration_local_hour_float64_v2"
+        if native
+        else "log_distance_duration_local_hour_v1",
+        "preprocessing_backend": "CPU NumPy float64 population scaling"
+        if native
+        else "CPU: numpy and sklearn StandardScaler",
+        "initialization_policy": "seeded_source_row_priority_first_k_v1"
+        if native
+        else "sklearn_kmeans_plusplus",
+        "execution_evidence": {
+            name: {
+                "backend": "cpu",
+                "implementation": "NumPy/pandas/scikit-learn",
+                "rows": eligible_rows,
+            }
+            for name in (
+                "features",
+                "sampling",
+                "scaler_fit",
+                "scaler_transform",
+                "kmeans_fit",
+                "kmeans_predict",
+                "evaluation",
+            )
+        },
         "splits": {key: value.isoformat() for key, value in bounds.items()},
         "samples": {key: sample.metadata() for key, sample in samples.items()},
         "canonical_rows": total_rows,
@@ -210,11 +248,11 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
         write_json(output_dir / "clustering.json", metadata)
         return {"tables": tables, "metadata": metadata}
 
-    scaler = StandardScaler()
-    train_matrix = scaler.fit_transform(feature_matrix(training)).astype(np.float32)
+    scaler = PopulationScaler() if native else StandardScaler()
+    train_matrix = scaler.fit_transform(matrix_for(training)).astype(np.float32)
     calibration = samples["calibration"].result()
     calibration_matrix = (
-        scaler.transform(feature_matrix(calibration)).astype(np.float32)
+        scaler.transform(matrix_for(calibration)).astype(np.float32)
         if len(calibration)
         else np.empty((0, 4), dtype=np.float32)
     )
@@ -223,7 +261,10 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
     fitted = {}
     with threadpool_limits(limits=threads):
         for k in k_values:
-            model, centers, elapsed = _fit_model(train_matrix, k, seed, backend)
+            centers = (
+                train_matrix[initial_center_indices(training, k, seed)].copy() if native else None
+            )
+            model, centers, elapsed = _fit_model(train_matrix, k, seed, backend, centers)
             assessment = _evaluate(model, calibration_matrix, backend)
             candidates.append(
                 {
@@ -253,7 +294,7 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
         del fitted
         held_out = samples["test"].result()
         test_matrix = (
-            scaler.transform(feature_matrix(held_out)).astype(np.float32)
+            scaler.transform(matrix_for(held_out)).astype(np.float32)
             if len(held_out)
             else np.empty((0, 4), dtype=np.float32)
         )
@@ -267,7 +308,14 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
         original_labels = np.asarray(model.predict(stability_matrix)).astype(np.int32)
         stability = []
         for alternate_seed in (seed + 1, seed + 2):
-            alternate, _, _ = _fit_model(train_matrix, chosen["k"], alternate_seed, backend)
+            centers = (
+                train_matrix[initial_center_indices(training, chosen["k"], alternate_seed)].copy()
+                if native
+                else None
+            )
+            alternate, _, _ = _fit_model(
+                train_matrix, chosen["k"], alternate_seed, backend, centers
+            )
             other_labels = np.asarray(alternate.predict(stability_matrix)).astype(np.int32)
             _sync(backend)
             stability.append(
@@ -286,12 +334,19 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
         "scale": scaler.scale_.tolist(),
         "centers": np.asarray(model.cluster_centers_).tolist(),
         "initial_centers": initial_centers.tolist(),
+        "initial_center_record_ids": training.iloc[
+            initial_center_indices(training, chosen["k"], seed)
+        ].record_id.tolist()
+        if native
+        else None,
         "k": chosen["k"],
         "seed": seed,
         "n_init": 1,
         "max_iter": 300,
         "tol": 1e-4,
         "training_sample_hash": samples["train"].metadata()["sample_ids_sha256"],
+        "sampling_policy": samples["train"].metadata()["method"],
+        "initialization_policy": base_metadata["initialization_policy"],
     }
     model_id = stable_id("kmeans", model_parameters)
     model_parameters["model_id"] = model_id
@@ -304,21 +359,23 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
                 output_dir / f"cluster_{period}_sample_ids.parquet", index=False
             )
 
-    plot_sample = HashSample(
-        min(5000, int(config.get("dashboard", {}).get("max_points", 5000))), seed
-    )
+    plot_sample = sampler(min(5000, int(config.get("dashboard", {}).get("max_points", 5000))), seed)
     summaries = []
     prediction_rows = 0
     writer = None
-    assignment_path = output_dir / "trip_cluster_assignment.parquet"
+    assignment_path = output_dir / (
+        "trip_cluster_assignment" if native else "trip_cluster_assignment.parquet"
+    )
+    if native:
+        assignment_path.mkdir()
     prediction_start = perf_counter()
     with threadpool_limits(limits=threads):
         try:
-            for batch in canonical_batches(canonical_dir, batch_rows):
+            for batch_index, batch in enumerate(canonical_batches(canonical_dir, batch_rows)):
                 eligible = valid_ml_rows(batch, filter_parameters)
                 if eligible.empty:
                     continue
-                matrix = scaler.transform(feature_matrix(eligible)).astype(np.float32)
+                matrix = scaler.transform(matrix_for(eligible)).astype(np.float32)
                 labels = np.asarray(model.predict(matrix)).astype(np.int32)
                 _sync(backend)
                 eligible["cluster"] = labels
@@ -327,9 +384,16 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
                 centers = np.asarray(model.cluster_centers_)
                 assignments["distance_to_center"] = np.linalg.norm(matrix - centers[labels], axis=1)
                 arrow = pa.Table.from_pandas(assignments, preserve_index=False)
-                if writer is None:
-                    writer = pq.ParquetWriter(assignment_path, arrow.schema, compression="zstd")
-                writer.write_table(arrow)
+                if native:
+                    pq.write_table(
+                        arrow,
+                        assignment_path / f"part-{batch_index:06d}.parquet",
+                        compression="zstd",
+                    )
+                else:
+                    if writer is None:
+                        writer = pq.ParquetWriter(assignment_path, arrow.schema, compression="zstd")
+                    writer.write_table(arrow)
                 prediction_rows += len(eligible)
                 plot_sample.add(eligible.drop(columns="eligible_ml"))
                 summaries.append(

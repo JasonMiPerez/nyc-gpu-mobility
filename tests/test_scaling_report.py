@@ -150,3 +150,52 @@ def test_saved_summary_disagreement_is_reported(tmp_path):
     report = REPORT.build_report(root)
     assert report["sizes"][0]["status"] == "not_validated"
     assert "saved summary disagrees" in " ".join(report["sizes"][0]["issues"])
+
+
+def test_native_report_requires_cpu_import_guard_and_complete_gpu_stage_plan(tmp_path):
+    from mobility.benchmarks.pipeline_scaling import BULK_STAGES, SCOPE, STAGE
+
+    root = experiment(tmp_path)
+    environment = json.loads((root / "benchmark_environment.json").read_text())
+    environment.update(execution_mode="native", timing_scope=SCOPE)
+    write_json(root / "benchmark_environment.json", environment)
+    trials = pd.read_parquet(root / "benchmark_runs.parquet")
+    trials["timing_scope"], trials["stage"] = SCOPE, STAGE
+    trials.to_parquet(root / "benchmark_runs.parquet", index=False)
+    for row in trials.to_dict("records"):
+        directory = root / "trials" / row["trial_id"]
+        manifest = json.loads((directory / "run_manifest.json").read_text())
+        manifest.update(
+            execution_mode="native",
+            execution_plan={
+                name: {"backend": row["backend"], "implementation": "fixture", "rows": 100}
+                for name in BULK_STAGES
+            },
+        )
+        if row["backend"] == "gpu":
+            manifest["models"]["graph"]["cpu_reference_elapsed_s"] = None
+        write_json(directory / "run_manifest.json", manifest)
+        write_json(
+            directory / "worker_result.json",
+            {
+                "loaded_gpu_modules": []
+                if row["backend"] == "cpu"
+                else ["cupy", "cudf", "cuml", "cugraph"],
+                "cpu_import_guard_enabled": row["backend"] == "cpu",
+            },
+        )
+        write_json(
+            directory / "comparison.json",
+            {"graph_validation": {"status": "passed", "actual": {"pagerank_max_abs_error": 1e-12}}},
+        )
+    valid = REPORT.build_report(root)
+    assert valid["sizes"][0]["status"] == "validated"
+    assert "Independent CPU reference checks run after" in REPORT.markdown(valid)
+    corrupted = root / "trials/months-6-measured-0-gpu/run_manifest.json"
+    manifest = json.loads(corrupted.read_text())
+    manifest["execution_plan"]["scaler_fit"]["backend"] = "cpu"
+    write_json(corrupted, manifest)
+    failed = REPORT.build_report(root)
+    assert failed["sizes"][0]["status"] == "not_validated"
+    assert failed["publication_candidate"] is None
+    assert "scaler_fit" in " ".join(failed["sizes"][0]["issues"])

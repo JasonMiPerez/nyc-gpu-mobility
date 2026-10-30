@@ -165,7 +165,7 @@ def test_small_six_month_pipeline_models_reconcile_and_publish(tmp_path):
     assert manifest["validation"]["counts"] == {"pickup": 180, "dropoff": 180, "od": 180}
     assert manifest["models"]["clustering"]["test"]["rows"] == 20
     assert manifest["models"]["anomalies"]["test_scored_bins"] > 0
-    assignments = pd.read_parquet(run / "tables" / "trip_cluster_assignment.parquet")
+    assignments = pd.read_parquet(run / "tables" / manifest["tables"]["trip_cluster_assignment"])
     assert len(assignments) == 180
     snapshot = publish_run(run, tmp_path / "artifacts")
     published = read_json(snapshot / "manifest.json")

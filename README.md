@@ -10,21 +10,42 @@ anomaly detectors, weighted PageRank, Louvain communities, and CPU/GPU performan
 experiments. Counts describe recorded taxi trips, not all NYC travel or unmet demand.
 Statistical alerts remain unreviewed until someone checks their explanation.
 
-The completed six-month GPU run `20261030T164900-a9f2d0b4` fits six cuML clusters
-and predicts **20,230,079 eligible trips**, reports **550 duration alert hours**
-merged into **374 unreviewed candidate incidents**, and executes cuGraph PageRank
-and Louvain on **263 mapped zones**. The earlier CPU study, quality refit, January
-GPU validation and stage benchmarks remain documented as historical results.
+Native experiment `native-pipeline-484be339070f` passed all **24 trials**:
+18 measured runs and six discarded warmups, on the same server with four CPU
+threads. These are full local raw-file processing times through model analysis
+and saved outputs; downloads, independent CPU reference checks and website
+publication are outside the timer.
 
-Full-pipeline experiment `pipeline-eb6b177f59b1` passed all **18 measured trials**
-at one, three and six months, with six discarded warmups. At six months, median
-CPU/GPU times were **342.734 / 334.459 seconds**: a modest **1.025× CPU/GPU ratio**,
-not the larger speedups seen for some isolated stages. See the completed
-[scaling report](docs/pipeline-scaling-results.md), [release results](docs/release-results.md)
-and [proposal audit](docs/proposal-coverage.md) for evidence and scope. Verification
-for this expansion: **159 local tests passed**, seven GPU-only tests skipped on
-the Mac, and **36 server checks passed**. Completion of these runs is separate
-from deploying their results to the public site.
+| Source months | CPU median seconds | GPU median seconds | CPU/GPU ratio |
+|---|---:|---:|---:|
+| January | 47.829 | 7.287 | 6.564× |
+| January–March | 148.470 | 17.564 | 8.453× |
+| January–June | 309.137 | 36.499 | **8.470×** |
+
+The retained six-month GPU run `20261030T191130-202b1964` selected **eight clusters**
+using April calibration and predicts **20,230,079 eligible trips**. Its model
+`kmeans-336273a6b0eac929` has a silhouette of **0.283492** on 2,000 May–June trips.
+It also produces **550 duration alert hours**, merged into **374 unreviewed
+candidate incidents**, and executes cuGraph PageRank/Louvain on **263 mapped zones**.
+It was selected as the first measured six-month GPU repetition, independently of
+runtime. Matched inputs do not guarantee identical fitted clusters or equal quality;
+the performance view includes each measured trial's model diagnostics.
+
+The default `processing.execution_mode: native` has separate CPU and GPU
+implementations. GPU bulk work now includes raw normalization, eligibility,
+numeric sampling, training-only feature scaling and both anomaly detectors,
+alongside cuDF aggregation, cuML clustering and cuGraph analysis. The CPU path
+uses CPU libraries throughout. All nine measured CPU trials recorded enforced
+CUDA import guards, no imported CUDA libraries and zero sampled process GPU memory.
+
+See the [native scaling report](docs/native-pipeline-results.md),
+[release results](docs/release-results.md) and [proposal audit](docs/proposal-coverage.md)
+for scope and limitations. Verification: **187 local tests passed**, 28 GPU tests
+were skipped on the Mac, and **27 actual server native checks passed**, in addition
+to the 24 pipeline trials. Computation and deployment are separate steps.
+The historical hybrid experiment's **1.025×** six-month ratio remains in its
+[original report](docs/pipeline-scaling-results.md). It used a different execution
+and sampling policy; its six-cluster fit and timings are not the native results.
 
 Public website: [NYC Mobility Observatory](https://nyc-mobility-observatory-jp.briny-fern-5873.chatgpt.site).
 It serves a compact interactive snapshot. The full Python app below supports
@@ -130,7 +151,7 @@ Only completed, matching, correctness-validated measured trials support a ratio.
 January and January–March lack the configured later evaluation periods; the
 six-month case adds held-out evaluation work as well as more rows. See
 [extended methods](docs/extended-methods.md) for the exact timing and memory scopes,
-and the [completed scaling report](docs/pipeline-scaling-results.md) for all
+and the [native scaling report](docs/native-pipeline-results.md) for all
 repetitions, interquartile ranges and sampled resource measurements.
 
 ## What to read in the code
@@ -165,12 +186,18 @@ from remaining work. Dataset source: the
 
 ## Scope
 
-Custom CUDA, cuDF aggregation, cuML clustering and cuGraph analysis are implemented.
-This is a hybrid pipeline: source normalization, timestamps/DST checks, primary
-quality masks, model sampling/scaling, and the two anomaly detectors run on CPU.
-The GPU graph path also runs a CPU reference for correctness. A GPU backend does
-not mean every operation runs on the device, and a small taxi-zone graph is not
-assumed to benefit from GPU execution.
+Native GPU execution uses cuDF/CuPy for bulk preparation and anomaly scoring,
+cuML for clustering and cuGraph for graph analysis. Host services still handle
+file discovery/checksums, metadata, small calendar/zone inputs, orchestration and
+reduced result finalization. Independent CPU reference checks run outside native
+GPU benchmark timing. Each saved run records stage backends and row counts in
+`execution_plan`; the website derives its labels from that evidence.
+
+`processing.execution_mode: legacy` preserves the historical hybrid path, whose
+CPU preparation, model sampling/scaling, anomaly scoring and internal graph
+reference were included in its timings. Historical and native experiments must
+not be pooled. Neither implementation assumes a small taxi-zone graph will
+benefit from GPU execution.
 
 Duration alerts compare hourly mean trip minutes within a pickup zone, weekday and
 hour. Changes in route, distance or destination mix can change that mean without

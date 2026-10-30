@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 import shutil
 import warnings
@@ -59,6 +60,8 @@ def _model_summary(models: dict) -> dict:
         "evaluation_status",
         "backend",
         "preprocessing_backend",
+        "initialization_policy",
+        "sampling_policy",
         "eligible_fraction",
         "canonical_eligible_rows",
         "threshold",
@@ -81,7 +84,7 @@ def _model_summary(models: dict) -> dict:
         "duration_anomalies_config",
         "trip_filter_thresholds",
     }
-    return {
+    result = {
         name: {
             key: value
             for key, value in model.items()
@@ -90,6 +93,55 @@ def _model_summary(models: dict) -> dict:
         }
         for name, model in models.items()
         if isinstance(model, dict)
+    }
+    for name, model in models.items():
+        if name in result:
+            # Publish the sampling method, never the individual sample identities.
+            method = model.get("samples", {}).get("train", {}).get("method")
+            if isinstance(method, str):
+                result[name].setdefault("sampling_policy", method)
+    return result
+
+
+def processing_metadata(manifest: dict) -> dict:
+    """Describe the saved run, including old snapshots without execution evidence."""
+    settings = manifest.get("config", {}).get("processing", {})
+    mode = manifest.get("execution_mode", settings.get("execution_mode", "legacy"))
+    plan = {
+        stage: {key: value[key] for key in ("backend", "implementation", "rows") if key in value}
+        for stage, value in manifest.get("execution_plan", {}).items()
+        if isinstance(value, dict)
+    }
+    models = manifest.get("models", {})
+
+    def backend(stage, model_name=None, fallback=None):
+        model = models.get(model_name, {})
+        value = plan.get(stage, {}).get("backend") or model.get("backend")
+        value = value or model.get("computation_backend") or fallback
+        if isinstance(value, str):
+            for label in ("cpu", "gpu"):
+                if value.lower().startswith(label):
+                    return label
+        return value or "unknown"
+
+    # Older volume/duration implementations were CPU-only. Do not infer that
+    # default for a native model whose execution evidence is missing.
+    def old_detector(name):
+        return "cpu" if mode == "legacy" and name in models else None
+
+    return {
+        "execution_mode": mode,
+        "execution_plan": plan,
+        "aggregation_backend": backend(
+            "aggregation", fallback=settings.get("backend", manifest.get("backend"))
+        ),
+        "clustering_backend": backend("kmeans_fit", "clustering"),
+        "anomaly_backend": backend("volume_scoring", "anomalies", old_detector("anomalies")),
+        "duration_anomaly_backend": backend(
+            "duration_scoring", "duration_anomalies", old_detector("duration_anomalies")
+        ),
+        "graph_backend": backend("graph", "graph"),
+        "browser_execution": "Precomputed snapshot; no GPU jobs run in the browser.",
     }
 
 
@@ -222,6 +274,131 @@ def _anomalies(repo: SnapshotRepository, prefix="anomaly") -> dict:
     return result
 
 
+def _json_value(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        return json.loads(value)
+    except (ValueError, TypeError):
+        return None
+
+
+def _finite_number(value):
+    return (
+        value
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        else None
+    )
+
+
+def clustering_quality_rows(trials: pd.DataFrame) -> list[dict]:
+    """Project scoped model diagnostics; never export whole model manifests."""
+    rows = trials.loc[trials.phase.eq("measured")] if "phase" in trials else trials
+    result = []
+    for row in rows.head(2000).to_dict("records"):
+        models = _json_value(row.get("model_quality_json"))
+        model = models.get("clustering", {}) if isinstance(models, dict) else {}
+        model = model if isinstance(model, dict) else {}
+        selected_k = _finite_number(model.get("selected_k", row.get("selected_k")))
+        candidates = model.get("candidates", [])
+        chosen = (
+            next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if isinstance(candidate, dict) and candidate.get("k") == selected_k
+                ),
+                {},
+            )
+            if isinstance(candidates, list)
+            else {}
+        )
+        calibration = chosen.get("calibration", {})
+        test = model.get("test", {})
+        calibration = calibration if isinstance(calibration, dict) else {}
+        test = test if isinstance(test, dict) else {}
+        selection_status = model.get("status")
+        test_status = model.get("test_status")
+        result.append(
+            {
+                key: row.get(key)
+                for key in (
+                    "experiment_id",
+                    "protocol_hash",
+                    "backend",
+                    "repeat",
+                    "validation",
+                )
+            }
+            | {
+                "months": row.get("months", row.get("month_count")),
+                "selected_k": selected_k,
+                "diagnostics_status": "recorded" if model else "not_recorded",
+                "selection_status": selection_status
+                if selection_status
+                in {
+                    "calibration_selected",
+                    "exploratory_no_calibration",
+                    "insufficient_training_rows",
+                }
+                else "not_recorded",
+                "test_status": test_status
+                if test_status
+                in {
+                    "evaluated",
+                    "no_held_out_rows",
+                }
+                else "not_recorded",
+                "training_rows": _finite_number(chosen.get("training_rows")),
+                "training_inertia_per_row": _finite_number(chosen.get("training_inertia_per_row")),
+                "calibration_rows": _finite_number(calibration.get("rows")),
+                "calibration_silhouette": _finite_number(calibration.get("silhouette")),
+                "test_rows": _finite_number(test.get("rows")),
+                "test_silhouette": _finite_number(test.get("silhouette")),
+                "test_mean_squared_center_distance": _finite_number(
+                    test.get("mean_squared_center_distance")
+                ),
+            }
+        )
+    return result
+
+
+def cpu_execution_evidence(trials: pd.DataFrame) -> dict:
+    """Summarize recorded native CPU isolation; missing NVML is never zero usage."""
+    rows = [
+        row
+        for row in trials.to_dict("records")
+        if row.get("backend") == "cpu"
+        and row.get("phase") == "measured"
+        and (
+            row.get("execution_mode") == "native"
+            or row.get("stage") == "native_production_pipeline"
+        )
+    ]
+    guards = sum(
+        row.get("cpu_import_guard_enabled") is True
+        and _json_value(row.get("loaded_gpu_modules_json")) == []
+        for row in rows
+    )
+    observed = [
+        row
+        for row in rows
+        if (_finite_number(row.get("gpu_samples")) or 0) > 0
+        and _finite_number(row.get("peak_gpu_memory_sampled_bytes")) is not None
+    ]
+    return {
+        "measured_native_cpu_trials": len(rows),
+        "guard_and_no_cuda_imports_confirmed": guards,
+        "zero_sampled_gpu_memory_trials": sum(
+            row["peak_gpu_memory_sampled_bytes"] == 0 for row in observed
+        ),
+        "nonzero_sampled_gpu_memory_trials": sum(
+            row["peak_gpu_memory_sampled_bytes"] > 0 for row in observed
+        ),
+        "gpu_memory_unavailable_trials": len(rows) - len(observed),
+    }
+
+
 def _benchmark_payload(repo: SnapshotRepository, trials: pd.DataFrame, *, pipeline=False) -> dict:
     comparisons = []
     if not trials.empty:
@@ -301,12 +478,19 @@ def _benchmark_payload(repo: SnapshotRepository, trials: pd.DataFrame, *, pipeli
                 "selected_k",
                 "cluster_eligible_rows",
                 "validation_elapsed_s",
+                "execution_mode",
+                "execution_plan_json",
+                "cpu_import_guard_enabled",
+                "cpu_cuda_context_check",
+                "loaded_gpu_modules_json",
             ],
             precision=12,
         ),
         "total_trials": len(trials),
         "display_limit": 2000,
         "comparisons": comparisons,
+        "clustering_quality": clustering_quality_rows(trials) if pipeline else [],
+        "cpu_execution_evidence": cpu_execution_evidence(trials) if pipeline else {},
         "environment": _public_environment(
             repo.manifest.get(
                 "pipeline_benchmark_environment" if pipeline else "benchmark_environment", {}
@@ -349,6 +533,7 @@ def _public_environment(environment: dict) -> dict:
         "resource_notes",
         "validation_notes",
         "model_notes",
+        "execution_mode",
     }
     result = {key: value for key, value in environment.items() if key in allowed}
     settings = environment.get("config", {})
@@ -455,6 +640,7 @@ def export_public(snapshot_dir: Path, destination_dist: Path) -> Path:
         for source in sources
         if isinstance(source, dict)
     ]
+    processing = processing_metadata(repo.manifest)
     meta = {
         "snapshot_id": repo.snapshot_id,
         "created_at": repo.manifest.get("created_at"),
@@ -466,18 +652,9 @@ def export_public(snapshot_dir: Path, destination_dist: Path) -> Path:
         "models": _model_summary(repo.manifest.get("models", {})),
         "splits": repo.manifest.get("config", {}).get("splits", {}),
         "anomaly_parameters": repo.manifest.get("config", {}).get("anomalies", {}),
-        "processing": {
-            "aggregation_backend": repo.manifest.get("config", {})
-            .get("processing", {})
-            .get("backend", "unknown"),
-            "clustering_backend": repo.manifest.get("models", {})
-            .get("clustering", {})
-            .get("backend", "unknown"),
-            "anomaly_backend": "cpu",
-            "duration_anomaly_backend": "cpu" if repo.has("duration_scores") else None,
-            "graph_backend": repo.manifest.get("models", {}).get("graph", {}).get("backend"),
-            "browser_execution": "Precomputed snapshot; no GPU jobs run in the browser.",
-        },
+        "processing": processing,
+        "execution_mode": processing["execution_mode"],
+        "execution_plan": processing["execution_plan"],
         "time_convention": "America/New_York — source local wall time",
         "export_kind": "static_published_snapshot",
         "max_flows": repo.max_flows,
@@ -559,6 +736,7 @@ def export_public(snapshot_dir: Path, destination_dist: Path) -> Path:
             "quality": _records(quality.head(2000)),
             "quality_total_rows": len(quality),
             "models": meta["models"],
+            "processing": processing,
             "validation": validation,
         },
     }

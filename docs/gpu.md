@@ -6,15 +6,37 @@ The web dashboard needs only the CPU environment and published artifacts.
 
 ## What runs on the GPU
 
-`mobility.backends.gpu` explicitly uses cuDF for endpoint/OD aggregation and CuPy
-for numerical features. Source adaptation, calendar/DST decisions and quality
-eligibility are prepared on the CPU. Their time and the transfer belong in a
-pipeline measurement. There is no automatic CPU fallback for a requested GPU run.
-Clustering has its own cuML implementation in `mobility.models`. Zone-network
-analysis uses cuGraph for weighted directed PageRank and weighted undirected
-Louvain communities, with NetworkX correctness checks. Both anomaly detectors
-currently use CPU calculations. ML feature/scaler preparation also remains CPU
-work; the published metadata distinguishes these stages.
+With `processing.execution_mode: native` (the default), the GPU path performs
+bulk source normalization, timestamp/quality checks, numerical features,
+sampling, training-only scaling, endpoint/OD aggregation and both anomaly
+detectors using cuDF/CuPy. It uses cuML KMeans and cuGraph PageRank/Louvain.
+The paired CPU implementation uses CPU libraries throughout, with a benchmark
+import guard preventing CUDA library imports. Both use the same numeric sample
+and initial-center policy, float64 features/scaler statistics and float32 model
+matrices. The manifest's `execution_plan` records each stage's backend and rows.
+
+GPU runs still use host services for file discovery/checksums, metadata, small
+zone/calendar inputs, job control and reduced output finalization. No bulk CPU
+fallback is allowed. Native graph results initially await independent CPU
+reference validation outside timed GPU processing. The completed experiment
+`native-pipeline-484be339070f` passed all 18 measured trials and six warmups,
+including those external checks. Its six-month CPU/GPU medians were
+309.137/36.499 seconds (8.470×). One- and three-month ratios were 6.564× and
+8.453×; all are recorded full-pipeline comparisons, not kernel-only claims.
+See the [native report](native-pipeline-results.md) for repetitions and resources.
+
+All nine measured CPU trials recorded an active CUDA import guard, no imported
+CUDA libraries and zero sampled process GPU memory. Native validation also passed
+27 actual server tests; the local suite passed 187 tests, with 28 GPU-only skips.
+At six months, maximum sampled host RSS was 2.231 GiB for CPU and 1.635 GiB for
+GPU runs; sampled GPU memory reached 7.926 GiB. These are observations across
+three repetitions, not exact peaks. Background desktop GPU processes remained
+running and are disclosed in the report.
+
+`processing.execution_mode: legacy` retains the old hybrid implementation:
+CPU source preparation, model sampling/scaling and anomaly calculations, plus
+NetworkX graph checks inside GPU pipeline timing. The historical six-month
+1.025× ratio measures that hybrid scope, not the native implementation.
 
 `processing.custom_cuda: true` selects the fused custom feature kernel during a
 yellow-taxi GPU pipeline. With `false`, ordinary GPU library operations are used.
@@ -69,7 +91,7 @@ allows certain CUDA 12.x applications on this driver family, with feature/PTX
 limitations. The passing tests establish compatibility for the operations used
 here; they do not establish that every CUDA 12.9 feature will work on this server.
 
-Actual server validation passed all 14 CPU/GPU contract tests, cuDF aggregation,
+Historical kernel/server validation passed all 14 CPU/GPU contract tests, cuDF aggregation,
 cuML KMeans, the custom NVRTC kernel (empty, single, 513, and 100,003 rows), and
 the standalone nvcc/CMake executable. All four Compute Sanitizer tools reported
 zero errors (racecheck also reported zero hazards). A separate Nsight Systems
@@ -78,7 +100,8 @@ could not access hardware counters (`ERR_NVGPUCTRPERM`); the failed attempt and
 permission error are preserved, and no occupancy/counter claims are made.
 Save `artifacts/gpu-validation/smoke.json`
 and the environment lock alongside final experiment artifacts. This validates
-the tested implementation/environment, not arbitrary future package versions.
+the tested implementation/environment, not the full native revision or arbitrary
+future package versions.
 
 Exact packages are frozen in `environments/gpu-linux-64.lock`; durable constraints
 are in `environments/gpu-pins.txt` and the server environment's `conda-meta/pinned`.
@@ -138,7 +161,9 @@ Use a new output directory. These trials include raw-source normalization,
 artifact writes, cuML/CPU clustering, both anomaly detectors and graph analysis.
 The expensive per-batch CPU aggregate reference is disabled during timing;
 complete outputs and model inputs are compared afterward. Built-in source and
-count reconciliation and the graph's CPU reference remain timed. Graph checks
+count reconciliation remain timed. For native trials, graph reference checks
+also run afterward; historical legacy trials included that reference inside
+the timer. Graph checks
 do not assume the same Louvain partition on both backends. One/three-month runs
 lack the later calibration/test data available to the six-month run.
 

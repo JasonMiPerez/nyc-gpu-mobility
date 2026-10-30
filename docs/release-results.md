@@ -1,13 +1,76 @@
 # Release results and measurement history
 
-These observations were recorded on October 30, 2026. They are measured results,
-not proposed targets from the original specification.
+These measured results were recorded on October 30, 2026. The current native
+experiment is documented in [native-pipeline-results.md](native-pipeline-results.md).
+Earlier experiments remain below with their original scope.
 
-The latest complete experiment is summarized in
-[pipeline-scaling-results.md](pipeline-scaling-results.md). The expanded release
-appears first; subsequent sections preserve earlier measurement scopes.
+## Separate native CPU and GPU implementations
 
-## Expanded six-month GPU analysis
+Experiment `native-pipeline-484be339070f` passed all **18 measured trials** and
+six discarded warmups on the same TITAN RTX server. Each backend processed the
+same source files using the same configuration, sample identities and starting
+centers. The experiment used four CPU threads, fresh processes, randomized backend
+order, one discarded warmup and three measured repetitions per backend and size.
+
+| Months | Source records | CPU median | GPU median | CPU/GPU ratio |
+|---|---:|---:|---:|---:|
+| 1 | 2,964,624 | 47.829 s | 7.287 s | 6.564× |
+| 3 | 9,554,778 | 148.470 s | 17.564 s | 8.453× |
+| 6 | 20,332,093 | 309.137 s | 36.499 s | 8.470× |
+
+The CPU workers block CUDA imports and hide CUDA devices. All nine measured CPU
+runs recorded no imported CUDA packages and zero sampled GPU process memory.
+The GPU path performs bulk normalization, eligibility checks, feature computation,
+numeric sampling, training-only scaling, aggregation, cuML clustering, both anomaly
+detectors and cuGraph algorithms on the GPU. File checksums/metadata, small calendar
+and zone inputs, sample identity hashes, alert-incident consolidation and bounded
+graph input/output preparation remain host work. CPU reference comparisons run
+after production timing for both implementations; they are not part of the GPU
+production path. The stopwatch includes raw-file reads and artifact writes.
+Worker bootstrap and GPU dependency preflight are excluded; lazy initialization
+inside production remains timed. Caches are not reset between fresh processes.
+
+The fixed publication rule selects the first measured six-month GPU repetition,
+run `20261030T191130-202b1964`, independently of its speed. It preserves the verified
+20,254,960 mapped pickups, 20,149,129 mapped drop-offs and 20,123,078 OD trips.
+Model `kmeans-336273a6b0eac929` fits 200,000 January–March trips, selects **eight
+clusters** using April, and predicts all **20,230,079** study-eligible trips.
+Both implementations use the new numeric sampling and explicit-center policies;
+these are new fits with new labels and evaluation samples. They should not be
+compared by cluster ID with the historical six-cluster models.
+
+The selected GPU model's 2,000-trip May–June silhouette is **0.28349170**; the
+corresponding CPU fit records **0.28349170**. Mean squared center distances are
+1.13335240 and 1.13336313 respectively. These show closely matching geometric
+quality, not ground-truth accuracy. Alternate-initialization adjusted Rand indices
+are 0.8621 and 0.4093. The revised study remains retrospective because its trip
+bounds were chosen after earlier full-period inspection.
+
+Duration results match the CPU reference: **550 May–June alert hours** and **374
+unreviewed candidate incidents**. Actual cuGraph analysis retains 263 zones,
+43,501 directed cross-zone pairs, three isolated zones and seven communities.
+Independent post-timing PageRank validation has maximum absolute error
+**2.43 × 10⁻¹⁷**; modularity is 0.19942128. The production run's original pending
+reference status is preserved in its archived trial; only the publication copy
+is enriched with the completed external validation.
+
+Across measured six-month runs, maximum sampled host RSS is **2.231 GiB CPU**
+and **1.635 GiB GPU**, with **7.926 GiB** sampled GPU process memory.
+Sampling reported no errors; these observations can miss brief peaks and include
+allocator reservations. Desktop GPU services remained active. Three repetitions
+on this host establish these measurements, not a universal speedup.
+
+The original experiment and exact source archive are retained under
+`artifacts/native-pipeline-20261030-complete/`. Archive SHA-256:
+`e0430210cc2c2b3fced34e7a2ca022ebec8faad5d286429118f8d57e995945db`.
+All 38 audited computational files match that archive; later dashboard changes
+are separate from the frozen calculation. Verification includes **187 local tests
+passed** (28 hardware-gated skips) and **27 native server tests passed**, including
+real CPU/GPU parity and a full workflow with CPU trip-processing calls forbidden
+inside GPU execution. The current browser check is saved in
+`artifacts/qa/browser-public.json`, identified by its snapshot ID.
+
+## Historical hybrid six-month GPU analysis
 
 Run `20261030T164900-a9f2d0b4` processes all **20,332,093** January–June 2024
 source records using the GPU pipeline. It retains the same verified totals:

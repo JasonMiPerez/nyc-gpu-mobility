@@ -28,6 +28,14 @@ def describe_trial(experiment, row):
     resources = (
         read_json(directory / "resources.json") if (directory / "resources.json").exists() else {}
     )
+    worker = (
+        read_json(directory / "worker_result.json")
+        if (directory / "worker_result.json").exists()
+        else {}
+    )
+    comparison = (
+        read_json(directory / "comparison.json") if (directory / "comparison.json").exists() else {}
+    )
     models = manifest.get("models", {})
     cluster, graph, duration = [
         models.get(name, {}) for name in ("clustering", "graph", "duration_anomalies")
@@ -43,6 +51,13 @@ def describe_trial(experiment, row):
         "validation": row["validation"],
         "elapsed_s": float(elapsed) if pd.notna(elapsed) else None,
         "manifest_available": bool(manifest),
+        "execution_mode": manifest.get("execution_mode", "legacy"),
+        "execution_plan": manifest.get("execution_plan", {}),
+        "gpu_batch_reference_checks": manifest.get("gpu_batch_reference_checks", False),
+        "models": {"graph": {"cpu_reference_elapsed_s": graph.get("cpu_reference_elapsed_s")}},
+        "loaded_gpu_modules": worker.get("loaded_gpu_modules"),
+        "cpu_import_guard_enabled": worker.get("cpu_import_guard_enabled"),
+        "graph_external_validation": comparison.get("graph_validation", {}),
         "resources": resources,
         "selected_k": cluster.get("selected_k"),
         "cluster_status": cluster.get("status"),
@@ -56,7 +71,9 @@ def describe_trial(experiment, row):
         "extra_graph_reference_pct": 100 * reference / elapsed
         if row["backend"] == "gpu" and reference is not None and pd.notna(elapsed) and elapsed > 0
         else 0.0,
-        "pagerank_max_abs_error": graph.get("validation", {}).get("pagerank_max_abs_error"),
+        "pagerank_max_abs_error": comparison.get("graph_validation", {})
+        .get("actual", {})
+        .get("pagerank_max_abs_error", graph.get("validation", {}).get("pagerank_max_abs_error")),
         "graph_communities": graph.get("community_count"),
         "graph_isolates": graph.get("isolated_zone_count"),
         "graph_modularity": graph.get("modularity"),
@@ -81,6 +98,7 @@ def build_report(experiment):
         "experiment_status": environment["status"],
         "expected_repetitions": expected,
         "timing_scope": environment.get("timing_scope"),
+        "execution_mode": environment.get("execution_mode", "legacy"),
         "sizes": [],
         "trials": details,
         "publication_candidate": None,
@@ -111,6 +129,26 @@ def build_report(experiment):
             ]
             if any(not item["manifest_available"] for item in subset):
                 size["issues"].append(f"{backend}: a trial manifest is missing")
+            if any(item["execution_mode"] != report["execution_mode"] for item in subset):
+                size["issues"].append(f"{backend}: execution mode differs from the experiment")
+            if report["execution_mode"] == "native":
+                from mobility.benchmarks.pipeline_scaling import validate_execution_plan
+
+                for item in subset:
+                    try:
+                        validate_execution_plan(item, backend)
+                        if backend == "cpu" and (
+                            item["loaded_gpu_modules"] != []
+                            or item["cpu_import_guard_enabled"] is not True
+                        ):
+                            raise ValueError("CPU CUDA-import exclusion was not established")
+                        memory = item["resources"].get("gpu", {}).get("sampled_process_peak_bytes")
+                        if backend == "cpu" and memory is not None and memory > 0:
+                            raise ValueError("CPU trial used GPU process memory")
+                        if item["graph_external_validation"].get("status") != "passed":
+                            raise ValueError("Independent post-timing graph validation is missing")
+                    except ValueError as error:
+                        size["issues"].append(f"{item['trial_id']}: {error}")
             metrics = {
                 "repetitions_present": len(rows),
                 "validated": bool(valid),
@@ -162,6 +200,11 @@ def build_report(experiment):
         for key in ("protocol_hash", "source_set_sha256", "input_rows", "timing_scope", "stage"):
             if selected[key].nunique(dropna=False) != 1:
                 size["issues"].append(f"Measured trials do not share one {key}")
+        if report["execution_mode"] == "native" and (
+            not selected.stage.eq("native_production_pipeline").all()
+            or not selected.timing_scope.eq(environment["timing_scope"]).all()
+        ):
+            size["issues"].append("Native and earlier hybrid benchmark scopes cannot be combined")
         size["input_rows"] = (
             int(selected.input_rows.iloc[0])
             if len(selected) and selected.input_rows.nunique() == 1
@@ -198,6 +241,7 @@ def markdown(report):
         "# Full-pipeline scaling report",
         "",
         f"Experiment `{report['experiment_id']}` · status: **{report['experiment_status']}**.",
+        f"Execution mode: **{report['execution_mode']}**; timing scope: `{report['timing_scope']}`. Compare only matching experiment scopes.",
         f"Expected measured repetitions per backend and size: {report['expected_repetitions']}. Warmups are excluded.",
         "",
         "| Months | Source rows | Backend | Status | Repetitions | Median s | Q25–Q75 s |",
@@ -266,7 +310,12 @@ def markdown(report):
             )
     lines += [
         "",
-        f"GPU runs include the CPU graph reference as validation work. In CPU runs, this is the graph computation itself, not additional overhead. Short chronological prefixes lack later calibration/test data. {report['expected_repetitions']} repetitions describe this experiment, not a universal winner or statistical significance.",
+        (
+            "Native GPU trials run all bulk preparation, model and graph stages on the GPU; CPU trials block CUDA package imports and hide CUDA devices. Independent CPU reference checks run after the stopwatch. Per-stage backend evidence and module audits are retained in the JSON. "
+            if report["execution_mode"] == "native"
+            else "Legacy GPU runs include the CPU graph reference as validation work. In CPU runs, this is the graph computation itself, not additional overhead. "
+        )
+        + f"Short chronological prefixes lack later calibration/test data. {report['expected_repetitions']} repetitions describe this experiment, not a universal winner or statistical significance.",
     ]
     candidate = report["publication_candidate"]
     if candidate:

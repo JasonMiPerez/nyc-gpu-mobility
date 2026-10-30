@@ -14,6 +14,7 @@ import plotly.express as px
 
 from mobility.serving.repository import Filters, QueryError, SnapshotRepository
 from . import charts
+from .static_export import clustering_quality_rows, cpu_execution_evidence, processing_metadata
 
 LOGGER = logging.getLogger(__name__)
 PAGES = {
@@ -134,6 +135,83 @@ def _cluster_inclusion(model):
     if excluded is not None:
         text += f" {excluded:,} otherwise eligible trips were excluded by these limits."
     return text
+
+
+def _model_preparation(manifest):
+    model = manifest.get("models", {}).get("clustering", {})
+    native = processing_metadata(manifest)["execution_mode"] == "native"
+    explanation = (
+        "Both native backends use the same numeric SplitMix64 source-row priority for "
+        "bounded samples and seeded initial centers. Features and training-only scaler "
+        "statistics use float64; standardized KMeans matrices use float32. "
+        if native
+        else "This historical model uses bounded deterministic samples and its saved "
+        "initialization policy, preceding the native numeric sampling policy. "
+    )
+    sampling = model.get("sampling_policy") or model.get("samples", {}).get("train", {}).get(
+        "method"
+    )
+    return (
+        explanation
+        + f"Sampling policy: {sampling or 'not recorded'}; "
+        + f"initialization policy: {model.get('initialization_policy', 'not recorded')}."
+    )
+
+
+def _processing_notes(manifest):
+    processing = processing_metadata(manifest)
+    names = {
+        "aggregation_backend": "aggregations",
+        "clustering_backend": "clustering",
+        "anomaly_backend": "pickup-volume anomalies",
+        "duration_anomaly_backend": "duration anomalies",
+        "graph_backend": "graph analysis",
+    }
+    backends = "; ".join(f"{label}: {processing[key]}" for key, label in names.items())
+    native = processing["execution_mode"] == "native"
+    explanation = (
+        "Native execution uses the recorded backend for bulk normalization, eligibility, "
+        "features, sampling/scaling, aggregation, clustering, both anomaly detectors and "
+        "graph algorithms. The CPU path uses CPU libraries throughout; the GPU path uses "
+        "cuDF/CuPy, cuML and cuGraph. Host services handle checksums, metadata, small calendar "
+        "and zone inputs, job control and reduced output finalization. Independent CPU "
+        "reference checks run after timed GPU processing."
+        if native
+        else "Historical execution uses a hybrid GPU path. Source preparation, model "
+        "sampling/scaling and anomaly scoring use CPU work, and the GPU graph's CPU "
+        "reference remains inside its pipeline time. These results predate native execution."
+    )
+    return [
+        f"Saved result backends — {backends}.",
+        explanation,
+        "Viewing charts displays saved results and does not start a GPU job.",
+    ]
+
+
+def _pipeline_execution_note(data, environment):
+    modes = {
+        row.get("execution_mode")
+        or (
+            "native"
+            if row.get("stage") == "native_production_pipeline"
+            else environment.get("execution_mode", "legacy")
+        )
+        for row in data.where(pd.notna(data), None).to_dict("records")
+    }
+    notes = []
+    if "native" in modes:
+        notes.append(
+            "Native trials compare entirely CPU analysis with GPU bulk processing, including "
+            "normalization, sampling/scaling and anomaly scoring. Independent CPU reference "
+            "checks, including graph validation, occur after timing."
+        )
+    if "legacy" in modes:
+        notes.append(
+            "Historical hybrid trials retain CPU preparation, sampling/scaling and anomaly "
+            "work; the GPU graph's CPU reference remains timed. Their speedups do not "
+            "describe the newer native implementation."
+        )
+    return " ".join(notes)
 
 
 def _coverage(frame: pd.DataFrame):
@@ -339,6 +417,7 @@ def patterns(repo: SnapshotRepository, filters: Filters, selected_cluster):
                         "does not have a separate calibration sample to select the cluster count."
                     ),
                     html.P(_cluster_inclusion(model)),
+                    html.P(_model_preparation(repo.manifest)),
                     summary_content,
                 ]
             ),
@@ -441,6 +520,14 @@ def _graph_panels(repo: SnapshotRepository, tiles=False):
                         f"Fixed graph for {str(start)[:10]} through {str(end)[:10]} (end exclusive). "
                         "Date, origin, destination and endpoint-metric controls do not recompute "
                         f"these graph results. Recorded graph backend: {backend}."
+                    ),
+                    html.P(
+                        "Graph validation: "
+                        + model.get("validation", {})
+                        .get("status", "not recorded")
+                        .replace("_", " ")
+                        + ". "
+                        + model.get("validation", {}).get("reference", "")
                     ),
                     html.P(
                         model.get(
@@ -950,6 +1037,19 @@ def _pipeline_benchmark_panels(repo: SnapshotRepository):
         "scope_notes",
         "Raw-source checksums, file reads, normalization, features, aggregation, model fitting/evaluation/prediction, graph/duration analysis, artifact writes and built-in reconciliation. Network acquisition and publication are excluded.",
     )
+    quality = pd.DataFrame(clustering_quality_rows(data))
+    evidence = cpu_execution_evidence(data)
+    cpu_note = (
+        f"Native CPU isolation: {evidence['guard_and_no_cuda_imports_confirmed']} of "
+        f"{evidence['measured_native_cpu_trials']} measured CPU trials recorded an active CUDA "
+        "import guard and no imported CUDA libraries. GPU process memory was sampled as zero "
+        f"in {evidence['zero_sampled_gpu_memory_trials']} trials, nonzero in "
+        f"{evidence['nonzero_sampled_gpu_memory_trials']}, and unavailable in "
+        f"{evidence['gpu_memory_unavailable_trials']}. Sampled zero describes recorded "
+        "observations, not continuous memory monitoring."
+        if evidence["measured_native_cpu_trials"]
+        else ""
+    )
     return [
         panel(
             "Full raw-file pipeline benchmark",
@@ -960,7 +1060,8 @@ def _pipeline_benchmark_panels(repo: SnapshotRepository):
                     ),
                     html.P(scope),
                     html.P(
-                        "Worker startup/imports, GPU preflight, cross-trial comparisons and final artifact hashing occur outside the timed interval. Lazy imports and initialization reached inside the pipeline remain timed. Built-in reconciliation and the graph's CPU reference also remain inside GPU trial times."
+                        "Worker startup/imports, GPU preflight, cross-trial comparisons and final artifact hashing occur outside the timed interval. Lazy imports and initialization reached inside the pipeline and built-in reconciliation remain timed. "
+                        + _pipeline_execution_note(data, environment)
                     ),
                     html.P(
                         "January and January–March have no April calibration or May–June test data. The six-month workload adds held-out evaluation as well as more records, so scaling across these prefixes does not isolate row-count growth. This full-pipeline scope is distinct from the stage benchmarks above."
@@ -977,7 +1078,39 @@ def _pipeline_benchmark_panels(repo: SnapshotRepository):
             table(comparisons, precision=6)
             if not comparisons.empty
             else notice("No matched validated full-pipeline CPU/GPU pair is available."),
-            "Ratio = median CPU seconds / median GPU seconds. Above 1 favors GPU, below 1 favors CPU, and 1 is equal. A positive ratio alone does not mean the GPU won.",
+            "Ratio = median CPU seconds / median GPU seconds. Above 1 favors GPU, below 1 favors CPU, and 1 is equal. A positive ratio alone does not mean the GPU won. "
+            + cpu_note,
+        ),
+        panel(
+            "Clustering quality by measured trial",
+            table(
+                quality,
+                [
+                    "months",
+                    "backend",
+                    "repeat",
+                    "selected_k",
+                    "training_rows",
+                    "training_inertia_per_row",
+                    "calibration_rows",
+                    "calibration_silhouette",
+                    "test_rows",
+                    "test_silhouette",
+                    "test_mean_squared_center_distance",
+                    "selection_status",
+                    "test_status",
+                    "validation",
+                    "diagnostics_status",
+                ],
+                limit=200,
+                precision=6,
+            ),
+            "All measured trials, including failures; warmups excluded. January and January–March "
+            "have no April calibration or May–June test data. Inertia and center distance are squared "
+            "distances in standardized feature space, not miles or minutes. Lower is more compact "
+            "for comparable inputs and group counts; higher silhouette indicates greater geometric "
+            "separation, not verified passenger categories. Matched inputs and passed output checks "
+            "do not guarantee identical fitted clusters or equal model quality. Missing values are unavailable, not zero.",
         ),
         panel(
             "Pipeline time and sampled memory",
@@ -1011,6 +1144,9 @@ def _pipeline_benchmark_panels(repo: SnapshotRepository):
                     "elapsed_s",
                     "validation",
                     "validation_elapsed_s",
+                    "execution_mode",
+                    "cpu_import_guard_enabled",
+                    "cpu_cuda_context_check",
                     "rss_sample_interval_s",
                     "gpu_sample_interval_s",
                     "rss_samples",
@@ -1034,6 +1170,9 @@ def _pipeline_benchmark_panels(repo: SnapshotRepository):
 def performance(repo: SnapshotRepository, timing_scope, backend):
     stage_panels = _stage_performance(repo, timing_scope, backend)
     return [
+        panel(
+            "Where the GPU was used", [html.P(note) for note in _processing_notes(repo.manifest)]
+        ),
         *(stage_panels if isinstance(stage_panels, list) else [stage_panels]),
         *_pipeline_benchmark_panels(repo),
     ]
@@ -1193,8 +1332,6 @@ def methods(repo: SnapshotRepository):
     cluster_model = repo.manifest.get("models", {}).get("clustering", {})
     graph_model = repo.manifest.get("models", {}).get("graph", {})
     duration_model = repo.manifest.get("models", {}).get("duration_anomalies", {})
-    snapshot_backend = repo.manifest.get("backend", "not recorded")
-    cluster_backend = cluster_model.get("backend", "not recorded")
     return [
         notice(
             "This snapshot is fixed. Date and zone controls do not change provenance, quality totals, model definitions, or benchmark configuration."
@@ -1222,11 +1359,15 @@ def methods(repo: SnapshotRepository):
             "Executed analysis and its limits",
             html.Div(
                 [
-                    html.P(
-                        f"This snapshot's processing backend is {snapshot_backend}; its KMeans "
-                        f"backend is {cluster_backend}. A CPU snapshot uses CPU analysis even when "
-                        "its performance section includes separately measured GPU experiments. "
-                        "Viewing charts does not start a GPU job."
+                    *[html.P(note) for note in _processing_notes(repo.manifest)],
+                    html.Details(
+                        [
+                            html.Summary("Recorded stage backends and row counts"),
+                            html.Pre(
+                                json.dumps(processing_metadata(repo.manifest), indent=2),
+                                className="code-block",
+                            ),
+                        ]
                     ),
                     html.P(
                         f"Graph analysis backend: {graph_model.get('backend', 'not recorded')}. "

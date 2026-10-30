@@ -20,8 +20,35 @@ import time
 import uuid
 
 
-SCOPE = "raw_files_to_models_and_artifacts_with_reconciliation"
-STAGE = "production_pipeline"
+SCOPE = "raw_files_to_native_models_and_artifacts_external_reference_validation"
+STAGE = "native_production_pipeline"
+LEGACY_SCOPE = "raw_files_to_models_and_artifacts_with_reconciliation"
+GPU_MODULES = {
+    "cupy",
+    "cupyx",
+    "cudf",
+    "pylibcudf",
+    "cuml",
+    "cugraph",
+    "pylibcugraph",
+    "rmm",
+    "pylibraft",
+}
+BULK_STAGES = {
+    "normalization",
+    "eligibility",
+    "features",
+    "sampling",
+    "scaler_fit",
+    "scaler_transform",
+    "aggregation",
+    "kmeans_fit",
+    "kmeans_predict",
+    "duration_aggregation",
+    "duration_scoring",
+    "volume_scoring",
+    "graph",
+}
 MARKER = ".pipeline-benchmark-owned"
 
 
@@ -53,6 +80,48 @@ def source_fingerprint(sources):
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
+def timing_identity(config):
+    native = config["processing"].get("execution_mode", "native") == "native"
+    return (STAGE, SCOPE) if native else ("production_pipeline", LEGACY_SCOPE)
+
+
+def loaded_gpu_modules():
+    return sorted(name for name in sys.modules if name.split(".", 1)[0] in GPU_MODULES)
+
+
+class CPUOnlyImports:
+    """Fail instead of allowing an optional GPU package to initialize in a CPU worker."""
+
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split(".", 1)[0] in GPU_MODULES:
+            raise RuntimeError(f"CPU-only worker forbids CUDA package import: {fullname}")
+        return None
+
+
+def validate_execution_plan(manifest, backend):
+    if manifest.get("execution_mode") != "native":
+        raise ValueError("Native benchmark did not produce a native execution manifest")
+    plan = manifest.get("execution_plan", {})
+    for name in BULK_STAGES:
+        stage = plan.get(name, {})
+        if stage.get("backend") != backend or not stage.get("implementation"):
+            raise ValueError(
+                f"Native {backend} stage {name} has missing or incorrect backend evidence"
+            )
+        if not isinstance(stage.get("rows"), int) or stage["rows"] < 0:
+            raise ValueError(f"Native stage {name} must declare its nonnegative row count")
+    allowed = {backend, "host_io", "host_finalize"}
+    if any(stage.get("backend") not in allowed for stage in plan.values()):
+        raise ValueError("Execution plan contains an undeclared compute fallback")
+    if backend == "gpu":
+        graph = manifest.get("models", {}).get("graph", {})
+        if graph.get("cpu_reference_elapsed_s") not in (None, 0):
+            raise ValueError("Native GPU graph ran a CPU reference inside the timed pipeline")
+        if manifest.get("gpu_batch_reference_checks"):
+            raise ValueError("Native GPU benchmark ran timed per-batch CPU references")
+    return plan
+
+
 def trial_config(config, months, backend, threads):
     if backend not in {"cpu", "gpu"}:
         raise ValueError("Backend must be cpu or gpu; no automatic fallback is allowed")
@@ -60,6 +129,7 @@ def trial_config(config, months, backend, threads):
     result["data"]["months"] = list(months)
     result["processing"].update(
         backend=backend,
+        execution_mode=result["processing"].get("execution_mode", "native"),
         cpu_threads=threads,
         custom_cuda=backend == "gpu",
         verify_gpu_batches=False,
@@ -277,6 +347,11 @@ class ResourceSampler:
 def _worker(request_path):
     request = _read(request_path)
     config = request["config"]
+    backend = config["processing"]["backend"]
+    if backend == "cpu":
+        if loaded_gpu_modules():
+            raise RuntimeError("CPU worker already has a CUDA package loaded")
+        sys.meta_path.insert(0, CPUOnlyImports())
     threads = config["benchmark"]["cpu_threads"]
     # Parent also sets these before interpreter startup; Arrow has separate pools.
     import pyarrow as pa
@@ -286,7 +361,7 @@ def _worker(request_path):
     pa.set_cpu_count(threads)
     pa.set_io_thread_count(threads)
     gpu = None
-    if config["processing"]["backend"] == "gpu":
+    if backend == "gpu":
         from mobility.backends import gpu
 
         gpu.require_cudf()
@@ -305,6 +380,18 @@ def _worker(request_path):
         except Exception as error:
             result["error"] = f"{type(error).__name__}: {error}"
         result["elapsed_s"] = time.perf_counter() - started
+    # Auditing is after the stopwatch. No CPU reference algorithm runs in GPU timing.
+    result["loaded_gpu_modules"] = loaded_gpu_modules()
+    result["cpu_import_guard_enabled"] = backend == "cpu"
+    if result["status"] == "complete":
+        try:
+            if backend == "cpu" and result["loaded_gpu_modules"]:
+                raise ValueError("CPU worker imported CUDA packages")
+            manifest = _read(Path(result["run_dir"]) / "manifest.json")
+            if config["processing"].get("execution_mode", "native") == "native":
+                result["execution_plan"] = validate_execution_plan(manifest, backend)
+        except Exception as error:
+            result.update(status="failed", error=f"{type(error).__name__}: {error}")
     print(json.dumps(result), flush=True)
     return 0 if result["status"] == "complete" else 1
 
@@ -313,6 +400,8 @@ def _launch(root, config, trial_dir, project_root):
     request = trial_dir / "request.json"
     _write(request, {"root": str(root), "config": config})
     env = os.environ.copy()
+    if config["processing"]["backend"] == "cpu":
+        env["CUDA_VISIBLE_DEVICES"] = ""
     threads = str(config["benchmark"]["cpu_threads"])
     for name in (
         "OMP_NUM_THREADS",
@@ -375,6 +464,24 @@ def _reference_files(run):
             "trip_histogram.parquet",
             "clustering.json",
             "cluster_parameters.json",
+            "cluster_train_sample_ids.parquet",
+            "cluster_calibration_sample_ids.parquet",
+            "cluster_test_sample_ids.parquet",
+            "anomaly_baseline.parquet",
+            "anomaly_scores.parquet",
+            "anomaly_calibration.parquet",
+            "duration_hour.parquet",
+            "duration_baseline.parquet",
+            "duration_scores.parquet",
+            "duration_calibration.parquet",
+            "duration_incidents.parquet",
+            "anomaly_incidents.parquet",
+            "graph_nodes.parquet",
+            "graph_edges.parquet",
+            "graph_undirected_edges.parquet",
+            "graph_analysis.json",
+            "duration_anomalies.json",
+            "anomalies.json",
         )
     ]
     return [path for path in files if path.exists()] + sorted(
@@ -390,6 +497,141 @@ def _save_reference(run, reference):
             os.link(path, target)
         except OSError:
             shutil.copy2(path, target)
+
+
+def compare_numeric_table(
+    actual, reference, keys, *, floating=(), ignored=(), rtol=1e-9, atol=1e-7
+):
+    """Keep counts, coverage, decisions and identifiers exact; tolerate only named numerics."""
+    import numpy as np
+    import pandas as pd
+
+    left, right = pd.read_parquet(actual), pd.read_parquet(reference)
+    if set(left.columns) != set(right.columns):
+        raise ValueError(f"Table columns differ: {Path(actual).name}")
+    left, right = [frame.sort_values(keys).reset_index(drop=True) for frame in (left, right)]
+    if left.duplicated(keys).any() or right.duplicated(keys).any():
+        raise ValueError(f"Duplicate comparison keys: {Path(actual).name}")
+    exact = right.columns.difference([*floating, *ignored])
+    pd.testing.assert_frame_equal(left[exact], right[exact], check_dtype=False, check_exact=True)
+    for name in set(floating) & set(right):
+        np.testing.assert_allclose(
+            left[name].to_numpy(dtype=float, na_value=np.nan),
+            right[name].to_numpy(dtype=float, na_value=np.nan),
+            rtol=rtol,
+            atol=atol,
+            equal_nan=True,
+            err_msg=f"{Path(actual).name}:{name}",
+        )
+
+
+def compare_graph(actual, reference):
+    """Independent CPU graph checks after timing, including each returned partition's quality."""
+    import networkx as nx
+    import numpy as np
+    import pandas as pd
+
+    required = [
+        "graph_nodes.parquet",
+        "graph_edges.parquet",
+        "graph_undirected_edges.parquet",
+        "graph_analysis.json",
+    ]
+    if not any((actual / name).exists() or (reference / name).exists() for name in required):
+        return {"status": "not_requested"}
+    if not all(
+        (directory / name).exists() for directory in (actual, reference) for name in required
+    ):
+        raise ValueError("Graph comparison artifacts are incomplete")
+    edges = pd.read_parquet(reference / "graph_edges.parquet")
+    undirected = pd.read_parquet(reference / "graph_undirected_edges.parquet")
+    nodes = pd.read_parquet(reference / "graph_nodes.parquet").sort_values("zone_id")
+    compare_numeric_table(
+        actual / required[1], reference / required[1], ["pickup_zone_id", "dropoff_zone_id"]
+    )
+    compare_numeric_table(actual / required[2], reference / required[2], ["zone_a", "zone_b"])
+    compare_numeric_table(
+        actual / required[0],
+        reference / required[0],
+        ["zone_id"],
+        ignored=["pagerank", "community"],
+    )
+    options = _read(reference / "graph_analysis.json")["parameters"]
+    directed, projection = nx.DiGraph(), nx.Graph()
+    vertices = nodes.zone_id.tolist()
+    directed.add_nodes_from(vertices)
+    projection.add_nodes_from(vertices)
+    directed.add_weighted_edges_from(
+        edges[["pickup_zone_id", "dropoff_zone_id", "trip_count"]].itertuples(
+            index=False, name=None
+        )
+    )
+    projection.add_weighted_edges_from(
+        undirected[["zone_a", "zone_b", "trip_count"]].itertuples(index=False, name=None)
+    )
+    expected = (
+        nx.pagerank(
+            directed,
+            alpha=options["pagerank_alpha"],
+            tol=options["pagerank_tol"] / max(1, len(vertices)),
+            max_iter=options["pagerank_max_iter"],
+            weight="weight",
+            backend="networkx",
+        )
+        if vertices
+        else {}
+    )
+    diagnostics = {}
+    for name, directory in (("actual", actual), ("reference", reference)):
+        table = pd.read_parquet(directory / "graph_nodes.parquet").sort_values("zone_id")
+        metadata = _read(directory / "graph_analysis.json")
+        if metadata["parameters"] != options or table.zone_id.tolist() != vertices:
+            raise ValueError("Graph vertex set or algorithm parameters differ")
+        values = table.pagerank.to_numpy(dtype=float)
+        target = np.array([expected[vertex] for vertex in vertices])
+        if (
+            not np.isfinite(values).all()
+            or (values < 0).any()
+            or (len(values) and not np.isclose(values.sum(), 1, atol=1e-6, rtol=0))
+        ):
+            raise ValueError("Graph PageRank mass or values are invalid")
+        np.testing.assert_allclose(
+            values, target, rtol=options["pagerank_rtol"], atol=options["pagerank_atol"]
+        )
+        if table.community.isna().any():
+            raise ValueError("Every graph vertex requires a community label")
+        groups = [set(group.zone_id) for _, group in table.groupby("community")]
+        for vertex in table.loc[table.is_isolated, "zone_id"]:
+            if next(group for group in groups if vertex in group) != {vertex}:
+                raise ValueError("Isolated graph vertices require singleton community labels")
+        modularity = (
+            nx.community.modularity(
+                projection,
+                groups,
+                weight="weight",
+                resolution=options["louvain_resolution"],
+                backend="networkx",
+            )
+            if len(undirected)
+            else None
+        )
+        reported = metadata.get("modularity")
+        if (modularity is None) != (reported is None) or (
+            modularity is not None and not np.isclose(modularity, reported, rtol=1e-5, atol=1e-6)
+        ):
+            raise ValueError("Graph modularity differs from an independent CPU recomputation")
+        diagnostics[name] = {
+            "pagerank_max_abs_error": float(np.max(np.abs(values - target)))
+            if len(values)
+            else 0.0,
+            "modularity": modularity,
+            "community_count": len(groups),
+        }
+    return {
+        "status": "passed",
+        "reference": "Independent post-timing NetworkX computation",
+        **diagnostics,
+    }
 
 
 def compare_outputs(run, reference):
@@ -446,14 +688,89 @@ def compare_outputs(run, reference):
     parameter_paths = [actual / "cluster_parameters.json", reference / "cluster_parameters.json"]
     if all(path.exists() for path in parameter_paths):
         a, b = map(_read, parameter_paths)
-        for name in ("mean", "scale", "training_sample_hash", "feature_names"):
+        for name in (
+            "training_sample_hash",
+            "feature_names",
+            "initial_center_policy",
+            "initialization_policy",
+            "sampling_policy",
+        ):
             if a.get(name) != b.get(name):
                 raise ValueError(f"Clustering preprocessing differs: {name}")
+        for name in ("mean", "scale"):
+            np.testing.assert_allclose(a[name], b[name], rtol=1e-12, atol=1e-12, err_msg=name)
+        ids_a, ids_b = a.get("initial_center_record_ids"), b.get("initial_center_record_ids")
+        if (ids_a is None) != (ids_b is None):
+            raise ValueError("Initial-center identity evidence differs")
+        if ids_a is not None:
+            common = min(len(ids_a), len(ids_b))
+            if len(ids_a) != a["k"] or len(ids_b) != b["k"] or ids_a[:common] != ids_b[:common]:
+                raise ValueError("Initial-center source identities differ")
+        if (
+            "initial_centers" in a
+            and "initial_centers" in b
+            and (a.get("k") == b.get("k") or ids_a is not None)
+        ):
+            common = min(len(a["initial_centers"]), len(b["initial_centers"]))
+            np.testing.assert_allclose(
+                a["initial_centers"][:common],
+                b["initial_centers"][:common],
+                rtol=1e-6,
+                atol=1e-6,
+                err_msg="float32 initial centers",
+            )
+    hour_keys = ["dataset_type", "zone_id", "hour"]
+    baseline_keys = ["dataset_type", "zone_id", "hour_of_week"]
+    detector_floats = [
+        "observed",
+        "baseline",
+        "mad",
+        "scale",
+        "score",
+        "deviation",
+        "threshold",
+        "absolute_threshold",
+    ]
+    specifications = {
+        "anomaly_baseline.parquet": (baseline_keys, ["baseline", "mad", "scale"]),
+        "duration_baseline.parquet": (baseline_keys, ["baseline", "mad", "scale"]),
+        "duration_hour.parquet": (hour_keys, ["duration_sum_minutes", "mean_duration_minutes"]),
+        "anomaly_scores.parquet": (hour_keys, detector_floats),
+        "duration_scores.parquet": (hour_keys, detector_floats),
+        "anomaly_calibration.parquet": (["threshold"], ["alert_fraction"]),
+        "duration_calibration.parquet": (["threshold"], ["alert_fraction"]),
+        "anomaly_incidents.parquet": (
+            ["dataset_type", "zone_id", "start_hour", "direction", "split"],
+            ["peak_score", "total_deviation"],
+        ),
+        "duration_incidents.parquet": (
+            ["dataset_type", "zone_id", "start_hour", "direction", "split"],
+            ["peak_score", "total_deviation"],
+        ),
+    }
+    for period in ("train", "calibration", "test"):
+        specifications[f"cluster_{period}_sample_ids.parquet"] = (["record_id"], [])
+    for filename, (keys, floating) in specifications.items():
+        present = [(directory / filename).exists() for directory in (actual, reference)]
+        if present[0] != present[1]:
+            raise ValueError(f"Comparison artifact availability differs: {filename}")
+        if all(present):
+            compare_numeric_table(
+                actual / filename,
+                reference / filename,
+                keys,
+                floating=floating,
+                ignored=["model_id"],
+            )
+            compared.append(filename)
+    graph_validation = compare_graph(actual, reference)
     return {
         "status": "passed",
         "aggregate_files": compared,
         "exact": "keys, integer counts, coverage, quality rules, histograms, model input samples",
         "floating_sum_tolerance": {"rtol": 1e-9, "atol": 1e-7},
+        "scaler_tolerance": {"rtol": 1e-12, "atol": 1e-12},
+        "graph_validation": graph_validation,
         "same_selected_k": first.get("selected_k") == second.get("selected_k"),
         "model_comparison": "Report quality separately; cluster labels and fitted centers need not match",
     }
@@ -496,6 +813,8 @@ def run_pipeline_scaling(
     from mobility.pipeline import source_list
 
     root, output_dir = Path(root).resolve(), Path(output_dir).resolve()
+    stage, scope = timing_identity(config)
+    native = stage == STAGE
     counts = sorted(set(month_counts))
     available = sorted(config["data"]["months"])
     if (
@@ -513,7 +832,7 @@ def run_pipeline_scaling(
     if output_dir.exists() and any(output_dir.iterdir()):
         raise ValueError("Use a new empty output directory to preserve existing experiments")
     output_dir.mkdir(parents=True, exist_ok=True)
-    experiment = "pipeline-" + uuid.uuid4().hex[:12]
+    experiment = ("native-pipeline-" if native else "pipeline-") + uuid.uuid4().hex[:12]
     scratch = _owned_directory(output_dir, "scratch", experiment)
     trials_dir = output_dir / "trials"
     trials_dir.mkdir()
@@ -544,9 +863,14 @@ def run_pipeline_scaling(
             "seed": seed,
             "keep_runs": keep_runs,
             "sources": [{k: v for k, v in item.items() if k != "local_path"} for item in sources],
-            "timing_scope": SCOPE,
+            "stage": stage,
+            "execution_mode": "native" if native else "legacy",
+            "timing_scope": scope,
             "scope_notes": "Raw-file checksums/read/normalization, features, aggregates, model fitting/evaluation/prediction, artifact writes and built-in reconciliation. No acquisition or publication. Worker startup/bootstrap imports, GPU dependency preflight, cross-trial comparisons and artifact hashing excluded. Lazy imports, initialization and compilation invoked inside the production pipeline remain timed.",
-            "gpu_validation_mode": "Per-batch CPU reference disabled for both backends; full aggregate comparison after timing",
+            "gpu_validation_mode": "CPU references for aggregates, detector outputs, model inputs and graphs run after timing"
+            if native
+            else "Legacy hybrid pipeline; per-batch aggregation reference disabled, internal graph reference retained",
+            "cpu_execution_contract": "CUDA packages blocked before pipeline imports; CUDA_VISIBLE_DEVICES empty; end-of-run module audit and sampled process GPU memory recorded",
             "cache_state": "Fresh process each trial; filesystem and CUDA compilation caches uncontrolled. Warmups are full discarded runs, not persistent-process warming.",
             "model_notes": "Identical configuration, chronological samples and preprocessing; selected cluster counts and fitted model quality reported, not assumed identical.",
         }
@@ -595,8 +919,9 @@ def run_pipeline_scaling(
                             "repeat": repeat,
                             "phase": phase,
                             "backend": backend,
-                            "stage": STAGE,
-                            "timing_scope": SCOPE,
+                            "stage": stage,
+                            "timing_scope": scope,
+                            "execution_mode": "native" if native else "legacy",
                             "months": count,
                             "input_rows": sum(s["parquet_row_count"] for s in selected_sources),
                             "source_set_sha256": source_fingerprint(selected_sources),
@@ -616,6 +941,11 @@ def run_pipeline_scaling(
                             row["elapsed_s"] = result.get("elapsed_s")
                             if result.get("status") != "complete" or result.get("returncode"):
                                 raise RuntimeError(result.get("error", "Worker did not complete"))
+                            gpu_bytes = resources["gpu"]["sampled_process_peak_bytes"]
+                            if backend == "cpu" and gpu_bytes is not None and gpu_bytes > 0:
+                                raise ValueError(
+                                    "CPU-only worker acquired sampled GPU process memory"
+                                )
                             run = Path(result["run_dir"])
                             validation_start = time.perf_counter()
                             manifest = _run_details(run, trial_dir)
@@ -636,6 +966,20 @@ def run_pipeline_scaling(
                             row.update(
                                 validation="warmup" if phase == "warmup" else "pending_match",
                                 validation_elapsed_s=time.perf_counter() - validation_start,
+                                loaded_gpu_modules_json=json.dumps(
+                                    result.get("loaded_gpu_modules", [])
+                                ),
+                                cpu_import_guard_enabled=result.get(
+                                    "cpu_import_guard_enabled", False
+                                ),
+                                execution_plan_json=json.dumps(result.get("execution_plan", {})),
+                                cpu_cuda_context_check=(
+                                    "zero sampled process GPU memory"
+                                    if gpu_bytes == 0
+                                    else "NVML unavailable; import/device guards enforced"
+                                )
+                                if backend == "cpu"
+                                else "not_applicable",
                                 peak_host_rss_sampled_bytes=resources["rss"]["sampled_peak_bytes"],
                                 peak_gpu_memory_sampled_bytes=resources["gpu"][
                                     "sampled_process_peak_bytes"

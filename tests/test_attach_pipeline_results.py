@@ -39,7 +39,7 @@ def prepared(tmp_path):
     modeled["graph"]["gpu_algorithms_executed"] = True
     modeled["clustering"]["backend"] = "gpu"
     manifest = json.loads((source_run / "manifest.json").read_text())
-    manifest.update(backend="gpu", models=modeled)
+    manifest.update(backend="gpu", models=modeled, execution_mode="legacy")
     (source_run / "manifest.json").write_text(json.dumps(manifest))
     shutil.copy2(source_run / "manifest.json", candidate / "run_manifest.json")
     checksums = {
@@ -128,3 +128,82 @@ def test_historical_benchmarks_stay_separate_with_original_values(prepared, help
     assert len(pd.read_parquet(target / "tables/pipeline_benchmark_runs.parquet")) == 6
     assert manifest["benchmark"]["experiment_id"] == "older-stage-experiment"
     assert manifest["pipeline_benchmark"]["experiment_id"] == "fixture"
+
+
+def test_native_graph_needs_external_validation_and_preserves_trial_evidence(prepared, helper):
+    from mobility.benchmarks.pipeline_scaling import BULK_STAGES, SCOPE, STAGE
+
+    measurements, target, _ = prepared
+    candidate = measurements / "trials/months-6-measured-0-gpu"
+    # Transport fixture only: no synthetic timings are presented as GPU evidence.
+    environment_path = measurements / "benchmark_environment.json"
+    environment = json.loads(environment_path.read_text())
+    environment.update(execution_mode="native", timing_scope=SCOPE)
+    environment_path.write_text(json.dumps(environment))
+    trials_path = measurements / "benchmark_runs.parquet"
+    trials = pd.read_parquet(trials_path)
+    trials["stage"], trials["timing_scope"] = STAGE, SCOPE
+    trials.to_parquet(trials_path, index=False)
+    for row in trials.to_dict("records"):
+        directory = measurements / "trials" / row["trial_id"]
+        manifest = json.loads((directory / "run_manifest.json").read_text())
+        manifest.update(
+            execution_mode="native",
+            execution_plan={
+                stage: {"backend": row["backend"], "implementation": "fixture", "rows": 100}
+                for stage in BULK_STAGES
+            },
+        )
+        manifest["models"]["graph"].update(
+            cpu_reference_elapsed_s=None,
+            validation={"status": "awaiting_external_reference"},
+        )
+        (directory / "run_manifest.json").write_text(json.dumps(manifest))
+        (directory / "worker_result.json").write_text(
+            json.dumps(
+                {
+                    "loaded_gpu_modules": [] if row["backend"] == "cpu" else ["cupy"],
+                    "cpu_import_guard_enabled": row["backend"] == "cpu",
+                }
+            )
+        )
+        (directory / "comparison.json").write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "graph_validation": {"status": "passed"},
+                }
+            )
+        )
+    manifest = json.loads((candidate / "run_manifest.json").read_text())
+    saved_graph = target / "tables/graph_analysis.json"
+    saved_graph.write_text(json.dumps(manifest["models"]["graph"]))
+    for path in [target / "manifest.json", candidate / "run_manifest.json"]:
+        path.write_text(json.dumps(manifest))
+    checksum_path = candidate / "artifact_checksums.json"
+    checksums = json.loads(checksum_path.read_text())
+    checksums["manifest.json"] = sha256_file(target / "manifest.json")
+    checksums["tables/graph_analysis.json"] = sha256_file(saved_graph)
+    checksum_path.write_text(json.dumps(checksums))
+    original_trial_hash = sha256_file(candidate / "run_manifest.json")
+    with pytest.raises(ValueError, match="post-timing graph validation"):
+        helper.attach(target, measurements)
+    assert sha256_file(target / "manifest.json") == checksums["manifest.json"]
+    assert not (target / "tables/pipeline_benchmark_runs.parquet").exists()
+
+    diagnostic = {"pagerank_max_abs_error": 1e-10, "modularity": 0.4, "community_count": 4}
+    (candidate / "comparison.json").write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "graph_validation": {"status": "passed", "actual": diagnostic},
+            }
+        )
+    )
+    attached = helper.attach(target, measurements)
+    validation = attached["models"]["graph"]["validation"]
+    assert validation["status"] == "passed"
+    assert validation["external_reference"] == diagnostic
+    assert "after production timing" in validation["reference"]
+    assert sha256_file(candidate / "run_manifest.json") == original_trial_hash
+    assert sha256_file(saved_graph) == checksums["tables/graph_analysis.json"]

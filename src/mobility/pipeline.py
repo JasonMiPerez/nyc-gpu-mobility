@@ -27,6 +27,7 @@ from mobility.aggregate import (
 from mobility.data.acquire import inspect_parquet
 from mobility.data.quality import hourly_dst_mask, normalize_yellow
 from mobility.io import atomic_json, read_json, sha256_file, utc_now
+from mobility.execution import execution_plan
 
 LOGGER = logging.getLogger(__name__)
 
@@ -142,6 +143,11 @@ def validate_outputs(output_dir: Path, expected: dict | None = None) -> dict:
 
 
 def run_pipeline(root: Path, config: dict, *, fit_models: bool = True) -> Path:
+    native = config["processing"].get("execution_mode", "legacy") == "native"
+    if native and config["processing"]["backend"] == "gpu":
+        from mobility.gpu_pipeline import run_gpu_pipeline
+
+        return run_gpu_pipeline(root, config, fit_models=fit_models)
     started = time.perf_counter()
     root = root.resolve()
     data_root, artifacts = root / "data", root / "artifacts"
@@ -166,6 +172,7 @@ def run_pipeline(root: Path, config: dict, *, fit_models: bool = True) -> Path:
         "sources": sources,
         "environment": environment_record(),
         "backend": config["processing"]["backend"],
+        "execution_mode": config["processing"].get("execution_mode", "legacy"),
         "data_kind": "synthetic"
         if any(s.get("data_kind") == "synthetic" for s in sources)
         else "real",
@@ -208,6 +215,11 @@ def run_pipeline(root: Path, config: dict, *, fit_models: bool = True) -> Path:
                 batch_size=config["processing"]["batch_rows"], columns=columns
             ):
                 frame, quality = normalize_yellow(batch.to_pandas(), source, mapped_ids, row_offset)
+                if native:
+                    frame["source_row"] = np.arange(
+                        row_offset, row_offset + len(frame), dtype=np.uint64
+                    )
+                    frame["source_token"] = np.uint64(int(source["sha256"][:16], 16))
                 frame.to_parquet(
                     canonical / f"part-{part_index:06d}.parquet", index=False, compression="zstd"
                 )
@@ -357,6 +369,11 @@ def run_pipeline(root: Path, config: dict, *, fit_models: bool = True) -> Path:
             study_end=end.isoformat(),
             tables=tables,
             models=model_result.get("models", {}),
+            execution_plan=execution_plan(
+                rows_total, model_result.get("models", {}), "cpu", len(zone_hour)
+            )
+            if native
+            else {},
             model_status=model_result.get("status"),
             gpu_batch_reference_checks=(
                 config["processing"]["backend"] == "gpu"

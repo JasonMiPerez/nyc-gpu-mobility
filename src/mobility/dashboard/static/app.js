@@ -170,12 +170,35 @@ function alertDefinition(metric, meta, data) {
 }
 
 function backendLabel(value) {
-  return typeof value === "string" && value ? value.toUpperCase() : "Not published";
+  return typeof value === "string" && value && value !== "unknown" ? value.toUpperCase() : "Not published";
 }
 
 function processingDescription(meta) {
   const processing = meta.processing || {};
-  return `<p>This snapshot contains <strong>${number(meta.raw_rows)} raw source records</strong>. Saved result backends: <strong>aggregations ${escapeHtml(backendLabel(processing.aggregation_backend))}</strong>, <strong>trip clustering ${escapeHtml(backendLabel(processing.clustering_backend))}</strong>, <strong>pickup-volume anomalies ${escapeHtml(backendLabel(processing.anomaly_backend))}</strong>, <strong>duration anomalies ${escapeHtml(backendLabel(processing.duration_anomaly_backend))}</strong>, and <strong>graph analysis ${escapeHtml(backendLabel(processing.graph_backend))}</strong>.</p><p>The GPU implementation uses CUDA/CuPy trip features, cuDF filtering and aggregations, cuML clustering, and cuGraph PageRank/Louvain when the corresponding backend above is GPU. Source/schema/time validation, model feature scaling, anomaly calculations and bounded graph preparation use CPU work. Viewing this website displays saved results and starts no GPU jobs.</p>`;
+  const native = (meta.execution_mode || processing.execution_mode) === "native";
+  const plan = meta.execution_plan || processing.execution_plan || {};
+  const explanation = native ?
+    "Native execution uses the recorded backend for bulk normalization, eligibility, features, sampling, scaling, aggregation, clustering, both anomaly detectors and graph algorithms. The CPU implementation uses CPU libraries throughout. The GPU implementation uses cuDF/CuPy, cuML and cuGraph for those stages; host work handles file checksums and metadata, small calendar/zone inputs, job control and reduced result finalization. Independent CPU reference checks occur after timed GPU processing." :
+    "Historical execution uses a hybrid GPU path: CUDA/CuPy features, cuDF aggregations, cuML clustering and cuGraph algorithms, while source preparation, model sampling/scaling and anomaly calculations use CPU work. Its GPU graph validation includes a CPU reference inside the pipeline. This scope differs from the newer native implementation.";
+  return `<p>This snapshot contains <strong>${number(meta.raw_rows)} raw source records</strong>. Saved result backends: <strong>aggregations ${escapeHtml(backendLabel(processing.aggregation_backend))}</strong>, <strong>trip clustering ${escapeHtml(backendLabel(processing.clustering_backend))}</strong>, <strong>pickup-volume anomalies ${escapeHtml(backendLabel(processing.anomaly_backend))}</strong>, <strong>duration anomalies ${escapeHtml(backendLabel(processing.duration_anomaly_backend))}</strong>, and <strong>graph analysis ${escapeHtml(backendLabel(processing.graph_backend))}</strong>.</p><p>${explanation} Viewing this website displays saved results and starts no GPU jobs.</p>${Object.keys(plan).length ? `<details class="technical-details"><summary>Recorded stage backends and row counts</summary><pre class="code-block">${escapeHtml(JSON.stringify(plan, null, 2))}</pre></details>` : ""}`;
+}
+
+function modelPreparationDescription(meta) {
+  const model = meta.models?.clustering || {};
+  const native = (meta.execution_mode || meta.processing?.execution_mode) === "native";
+  const method = native ?
+    "Both native backends use the same numeric SplitMix64 source-row priority to select bounded samples and seeded initial centers. Features and training-only scaler statistics use float64; the standardized KMeans matrix uses float32." :
+    "This historical model uses bounded deterministic samples and its saved initialization policy; it predates the native numeric sampling policy.";
+  return `${method} Recorded sampling policy: ${model.sampling_policy || "not published"}; initialization policy: ${model.initialization_policy || "not published"}.`;
+}
+
+function pipelineExecutionDescription(rows, environment = {}) {
+  const modes = new Set(rows.map((row) => row.execution_mode ||
+    (row.stage === "native_production_pipeline" ? "native" : environment.execution_mode || "legacy")));
+  const descriptions = [];
+  if (modes.has("native")) descriptions.push("Native trials compare an entirely CPU analysis with GPU bulk processing, including normalization, sampling/scaling and anomaly scoring. Independent CPU reference checks, including graph validation, run after timing.");
+  if (modes.has("legacy")) descriptions.push("Historical hybrid trials retain CPU preparation, sampling/scaling and anomaly work; the GPU graph's CPU reference is included in their elapsed time. These timings do not measure the newer native implementation.");
+  return descriptions.join(" ");
 }
 
 function communityPalette(nodes) {
@@ -205,6 +228,20 @@ function pipelineMedians(rows) {
 
 function memoryGiB(value) {
   return Number.isFinite(value) && value >= 0 ? number(value / 2 ** 30, 3) : "Unavailable";
+}
+
+function pipelineQualityRow(row) {
+  const result = { ...row };
+  for (const key of ["training_inertia_per_row", "calibration_silhouette", "test_silhouette", "test_mean_squared_center_distance"])
+    result[key] = Number.isFinite(row[key]) ? number(row[key], 6) : "Unavailable";
+  for (const key of ["selection_status", "test_status", "diagnostics_status"])
+    result[key] = String(row[key] || "not_recorded").replaceAll("_", " ");
+  return result;
+}
+
+function cpuEvidenceDescription(evidence = {}) {
+  if (!evidence.measured_native_cpu_trials) return "";
+  return `Native CPU isolation: ${number(evidence.guard_and_no_cuda_imports_confirmed)} of ${number(evidence.measured_native_cpu_trials)} measured CPU trials recorded an active CUDA import guard and no imported CUDA libraries. GPU process memory was sampled as zero in ${number(evidence.zero_sampled_gpu_memory_trials)} trials, nonzero in ${number(evidence.nonzero_sampled_gpu_memory_trials)}, and unavailable in ${number(evidence.gpu_memory_unavailable_trials)}. Sampled zero is evidence from the recorded observations, not continuous memory monitoring.`;
 }
 
 function pipelineResourceRow(row) {
@@ -605,7 +642,7 @@ async function patterns(request) {
         ],
         20,
       ),
-      `KMeans groups trips by log(1 + distance), log(1 + duration), and pickup hour encoded around a 24-hour circle, so 23:00 and 00:00 are close. Features are standardized using training data only. ${status === "calibration_selected" ? `${clusterCount ? `${clusterCount} groups were` : "The group count was"} selected on calibration data (${periodLabel(modelSplits(), "calibration")}) after fitting on training data (${periodLabel(modelSplits(), "train")}).` : "See model status for the fitting and selection periods."} Zone IDs are not clustering inputs. Group numbers are arbitrary labels, not neighborhoods or known passenger purposes. Counts and means describe eligible trips in the scoring period.`,
+      `KMeans groups trips by log(1 + distance), log(1 + duration), and pickup hour encoded around a 24-hour circle, so 23:00 and 00:00 are close. Features are standardized using training data only. ${status === "calibration_selected" ? `${clusterCount ? `${clusterCount} groups were` : "The group count was"} selected on calibration data (${periodLabel(modelSplits(), "calibration")}) after fitting on training data (${periodLabel(modelSplits(), "train")}).` : "See model status for the fitting and selection periods."} Zone IDs are not clustering inputs. Group numbers are arbitrary labels, not neighborhoods or known passenger purposes. Counts and means describe eligible trips in the scoring period. ${modelPreparationDescription(state.summary.meta)}`,
     ) +
     panel(
       "Distance and duration",
@@ -764,6 +801,7 @@ async function renderGraph(data, request) {
   byId("graph-section").innerHTML =
     panel("Zone network analysis",
       notice(`Fixed full-period graph: ${number(metadata.mapped_zone_count ?? rows.length)} mapped zones, ${number(metadata.directed_edge_count)} directed cross-zone pairs, ${number(metadata.retained_trip_count)} retained trips. Backend: ${backendLabel(metadata.backend)}. Origin, destination and top-pair controls above do not change these results.`) +
+      `<p>Graph validation: <strong>${escapeHtml((metadata.validation?.status || "not recorded").replaceAll("_", " "))}</strong>${metadata.validation?.reference ? ` · ${escapeHtml(metadata.validation.reference)}` : ""}.</p>` +
       `<p><strong>PageRank</strong> measures a zone's incoming network connectivity, taking the strengths of its incoming connections into account. Edge weights are recorded trip counts; the scores sum to one across all mapped zones. PageRank is not a trip count.</p><p><strong>Louvain communities</strong> group zones with strong weighted connections. For this calculation, A → B and B → A are added into one undirected pair. Colors and group numbers are categories, not a ranking, and the groups need not match borough boundaries.</p><div class="graph-controls"><label for="graph-view">Color the zone map by</label><select id="graph-view"><option value="community">Louvain community</option><option value="pagerank">PageRank connectivity</option></select></div>${chartDiv("graph-map")}<div id="graph-legend" class="community-legend" aria-label="Community colors"></div>`,
       `Directed pairs require at least ${number(metadata.parameters?.min_trips_per_edge ?? 1)} trips after aggregation. ${number(metadata.self_trip_count)} within-zone trips are reported separately and excluded from both graph algorithms. ${number(metadata.isolated_zone_count)} zones have no retained cross-zone edge; they remain included. This small zone graph does not imply a GPU speed advantage.`) +
     panel("Zone connectivity and communities", table(rows.map((row) => ({
@@ -1046,11 +1084,12 @@ function renderPipelinePerformance(data) {
   const measured = data.trials.filter((row) => row.phase === "measured");
   const warmups = data.trials.filter((row) => row.phase === "warmup");
   const comparisons = data.comparisons || [];
+  const cpuEvidence = cpuEvidenceDescription(data.cpu_execution_evidence);
   const monthByRows = new Map(measured.map((row) => [Number(row.input_rows), row.months ?? row.month_count]));
   target.innerHTML =
     panel("Full pipeline scaling",
       notice(`${number(rows.length)} validated measured runs; ${number(warmups.length)} warmups and ${number(measured.length - rows.length)} unvalidated measured runs excluded from the timing chart. Stage timing/backend selectors do not change these full-pipeline panels.`) + chartDiv("pipeline-chart"),
-      "Starts with local raw TLC files and runs checks, cleaning, features, aggregations, clustering, both anomaly detectors, graph analysis and artifact writes. Built-in checks are included, including the GPU graph's CPU reference calculation. Downloads, separate benchmark validation and website publication are excluded. Six months adds calibration/test work absent from one/three-month runs, so scaling reflects more records and more analysis. Points are measured medians; whiskers show the observed minimum and maximum.") +
+      `Starts with local raw TLC files and runs checks, cleaning, features, aggregations, clustering, both anomaly detectors, graph analysis and artifact writes. ${pipelineExecutionDescription(data.trials, data.environment)} Downloads, separate benchmark validation and website publication are excluded. Six months adds calibration/test work absent from one/three-month runs, so scaling reflects more records and more analysis. Points are measured medians; whiskers show the observed minimum and maximum.`) +
     panel("Matched full pipeline CPU/GPU comparisons", comparisons.length ? table(comparisons.map((row) => ({
       ...comparisonDisplay(row), months: monthByRows.get(Number(row.input_rows)),
       protocol: row.protocol_hash ? String(row.protocol_hash).slice(0, 12) : "Not recorded",
@@ -1059,7 +1098,17 @@ function renderPipelinePerformance(data) {
       ["gpu_seconds", "GPU seconds"], ["time_ratio", "CPU time / GPU time"], ["faster", "Faster backend"],
       ["experiment_id", "Experiment"], ["protocol", "Protocol ID"],
     ]) : notice("No CPU/GPU pair has passed matching-workload validation for this experiment yet."),
-      "Each ratio pairs the same experiment, input rows, stage, timing scope and protocol. Warmups are excluded. A ratio below one means the CPU finished faster. These pipeline comparisons are separate from the older stage experiments below.") +
+      `Each ratio pairs the same experiment, input rows, stage, timing scope and protocol. Warmups are excluded. A ratio below one means the CPU finished faster. These pipeline comparisons are separate from the older stage experiments below. ${cpuEvidence}`) +
+    panel("Clustering quality by measured trial", data.clustering_quality?.length ? table(data.clustering_quality.map(pipelineQualityRow), [
+      ["months", "Months"], ["backend", "Backend"], ["repeat", "Repeat"], ["selected_k", "Selected groups"],
+      ["training_rows", "Training rows"], ["training_inertia_per_row", "Training inertia / row"],
+      ["calibration_rows", "Calibration rows"], ["calibration_silhouette", "Calibration silhouette"],
+      ["test_rows", "Test rows"], ["test_silhouette", "Test silhouette"],
+      ["test_mean_squared_center_distance", "Test mean squared center distance"],
+      ["selection_status", "Selection status"], ["test_status", "Test status"],
+      ["validation", "Trial validation"], ["diagnostics_status", "Diagnostics"],
+    ], 200) : notice("Clustering-quality diagnostics were not published for these historical trial records."),
+      "Every measured trial is shown, including failures; warmups are excluded. January and January–March contain no April calibration or May–June test data. Training inertia and test center distance are squared distances in standardized feature space, not miles or minutes; lower is more compact for comparable feature inputs and group counts. Higher silhouette indicates better geometric separation, not verified passenger categories. Matching inputs and passed output checks do not guarantee identical fitted clusters or equal model quality. Missing metrics are unavailable, not zero.") +
     panel("Full pipeline sampled resources", table(measured.map(pipelineResourceRow), [
       ["months", "Months"], ["backend", "Backend"], ["repeat", "Repeat"], ["input_rows", "Raw rows"],
       ["elapsed_s", "Seconds"], ["host_gib", "Sampled host peak (GiB)"], ["gpu_gib", "Sampled GPU peak (GiB)"],

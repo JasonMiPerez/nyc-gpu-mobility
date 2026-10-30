@@ -93,6 +93,34 @@ assert(description.includes('aggregations GPU'));
 assert(description.includes('graph analysis GPU'));
 assert(!description.includes('built on the CPU'));
 assert(context.processingDescription({}).includes('Not published'));
+assert(description.includes('Historical execution'));
+for (const backend of ['cpu', 'gpu']) {
+  const meta = { execution_mode: 'native', execution_plan: {
+    volume_scoring: { backend, implementation: 'scoring', rows: 100 } },
+    processing: { anomaly_backend: backend, duration_anomaly_backend: backend } };
+  const nativeDescription = context.processingDescription(meta);
+  assert(nativeDescription.includes(`pickup-volume anomalies ${backend.toUpperCase()}`));
+  assert(nativeDescription.includes(`duration anomalies ${backend.toUpperCase()}`));
+  assert(nativeDescription.includes('Recorded stage backends'));
+  assert(!nativeDescription.includes('Historical execution'));
+  assert(context.modelPreparationDescription(meta).includes('SplitMix64'));
+  assert(context.modelPreparationDescription(meta).includes('float64'));
+}
+const nativeTrials = [{ stage: 'native_production_pipeline', execution_mode: 'native' }];
+assert(context.pipelineExecutionDescription(nativeTrials).includes('after timing'));
+assert(!context.pipelineExecutionDescription(nativeTrials).includes('included in their elapsed'));
+assert(context.pipelineExecutionDescription(trials).includes('Historical hybrid trials'));
+assert(context.pipelineExecutionDescription([...trials, ...nativeTrials]).includes('Native trials'));
+const quality = context.pipelineQualityRow({ training_inertia_per_row: 0.812345,
+  test_silhouette: null, test_mean_squared_center_distance: 0, test_status: 'no_held_out_rows' });
+assert.equal(quality.training_inertia_per_row, '0.812345');
+assert.equal(quality.test_silhouette, 'Unavailable');
+assert.equal(quality.test_mean_squared_center_distance, '0.000000');
+assert.equal(quality.test_status, 'no held out rows');
+assert.equal(context.cpuEvidenceDescription({}), '');
+assert(context.cpuEvidenceDescription({ measured_native_cpu_trials: 3, guard_and_no_cuda_imports_confirmed: 3,
+  zero_sampled_gpu_memory_trials: 2, nonzero_sampled_gpu_memory_trials: 0,
+  gpu_memory_unavailable_trials: 1 }).includes('unavailable in 1'));
 context.volumeData = { alerts: [{ zone_id: 1, context_id: '0', hour: '2024-06-01T00:00:00', split: 'test',
   observed: 50, baseline: 10, score: 8, threshold: 4, history_count: 12 }],
   incidents: [], contexts: { '0': [{ hour: '2024-06-01T00:00:00', observed: 50, baseline: 10, is_alert: true }] },
@@ -127,9 +155,15 @@ vm.runInContext(`state.cache.set('anomalies.json', Promise.resolve(volumeData));
   elements.get('graph-view').value = 'pagerank';
   elements.get('graph-view').onchange();
   assert.equal(plots.filter((plot) => plot.id === 'graph-map').at(-1).traces.length, 1);
-  context.renderPipelinePerformance({ trials, comparisons: [], environment: {} });
+  context.renderPipelinePerformance({ trials, comparisons: [], environment: {},
+    clustering_quality: [{ months: 6, backend: 'gpu', repeat: 0, selected_k: 6,
+      training_inertia_per_row: 0.812345, test_silhouette: 0.345678 }] });
   assert(elements.get('pipeline-section').innerHTML.includes('not guaranteed peak memory'));
   assert(elements.get('pipeline-section').innerHTML.includes('No CPU/GPU pair has passed'));
+  assert(elements.get('pipeline-section').innerHTML.includes('Clustering quality by measured trial'));
+  assert(elements.get('pipeline-section').innerHTML.includes('0.812345'));
+  assert(elements.get('pipeline-section').innerHTML.includes('0.345678'));
+  assert(elements.get('pipeline-section').innerHTML.includes('do not guarantee identical fitted clusters'));
   assert(plots.some((plot) => plot.id === 'pipeline-chart'));
 })().catch((error) => { console.error(error); process.exitCode = 1; });
 """

@@ -55,6 +55,11 @@ def attach(run: Path, experiment: Path, historical_run: Path | None = None):
     comparison = read_json(trial_dir / "comparison.json")
     if comparison.get("status") != "passed":
         raise ValueError("The selected trial did not pass its post-timing output comparison.")
+    external_graph = comparison.get("graph_validation", {})
+    if manifest.get("execution_mode") == "native" and (
+        external_graph.get("status") != "passed" or not external_graph.get("actual")
+    ):
+        raise ValueError("Native GPU publication needs independent post-timing graph validation.")
     validate_outputs(run / "tables", manifest["validation"]["counts"])
     prior = None
     historical_files = {}
@@ -71,6 +76,13 @@ def attach(run: Path, experiment: Path, historical_run: Path | None = None):
                 raise ValueError(f"Missing or unsafe historical benchmark table: {name}")
             historical_files[name] = artifact
     manifest = copy.deepcopy(manifest)
+    if manifest.get("execution_mode") == "native":
+        manifest["models"]["graph"]["validation"].update(
+            status="passed",
+            reference="Independent NetworkX computation after production timing",
+            pagerank_max_abs_error=external_graph["actual"]["pagerank_max_abs_error"],
+            external_reference=external_graph["actual"],
+        )
     output = run / "tables"
     trials = pd.read_parquet(experiment / "benchmark_runs.parquet")
     # Add sampling diagnostics from the corresponding recorded monitor output.

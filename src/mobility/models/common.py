@@ -71,7 +71,10 @@ def canonical_batches(directory: Path, batch_rows: int) -> Iterator[pd.DataFrame
         missing = set(TRIP_COLUMNS) - set(parquet.schema_arrow.names)
         if missing:
             raise ValueError(f"Canonical file {path.name} lacks {sorted(missing)}")
-        for batch in parquet.iter_batches(batch_size=batch_rows, columns=TRIP_COLUMNS):
+        columns = TRIP_COLUMNS + [
+            name for name in ("source_token", "source_row") if name in parquet.schema_arrow.names
+        ]
+        for batch in parquet.iter_batches(batch_size=batch_rows, columns=columns):
             frame = batch.to_pandas()
             frame["pickup_local"] = pd.to_datetime(frame["pickup_local"])
             yield frame
@@ -134,7 +137,7 @@ def valid_ml_rows(frame: pd.DataFrame, parameters: dict | None = None) -> pd.Dat
     return frame.loc[ml_row_masks(frame, parameters)["model_eligible"]].copy()
 
 
-def feature_matrix(frame: pd.DataFrame) -> np.ndarray:
+def feature_matrix(frame: pd.DataFrame, dtype=np.float32) -> np.ndarray:
     hour = frame["pickup_local"].dt.hour.to_numpy(dtype=np.float64)
     return np.column_stack(
         [
@@ -143,7 +146,7 @@ def feature_matrix(frame: pd.DataFrame) -> np.ndarray:
             np.sin(2 * np.pi * hour / 24),
             np.cos(2 * np.pi * hour / 24),
         ]
-    ).astype(np.float32)
+    ).astype(dtype)
 
 
 class HashSample:
@@ -192,6 +195,63 @@ class HashSample:
             "sample_ids_sha256": hashlib.sha256(identities.encode()).hexdigest(),
             "inclusion_fraction": len(frame) / self.rows_seen if self.rows_seen else 0.0,
         }
+
+
+def priority_values(tokens, rows, seed):
+    """Matched CPU/GPU sampling priorities, with explicit uint64 wraparound."""
+    tokens, rows = np.asarray(tokens, dtype=np.uint64), np.asarray(rows, dtype=np.uint64)
+    with np.errstate(over="ignore"):
+        value = (tokens ^ rows ^ np.uint64(seed % 2**64)) + np.uint64(0x9E3779B97F4A7C15)
+        value = (value ^ (value >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+        value = (value ^ (value >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return value ^ (value >> np.uint64(31))
+
+
+def initial_center_indices(training, k, seed):
+    priorities = priority_values(training.source_token, training.source_row, seed)
+    return np.lexsort(
+        (training.source_row.to_numpy(), training.source_token.to_numpy(), priorities)
+    )[:k]
+
+
+class PrioritySample(HashSample):
+    """Bounded numeric sampling with the same algorithm on CPU and GPU."""
+
+    def add(self, frame):
+        if frame.empty:
+            return
+        if not {"source_token", "source_row"} <= set(frame):
+            raise ValueError("Native sampling requires canonical source_token and source_row.")
+        self.rows_seen += len(frame)
+        candidate = frame.copy()
+        candidate["_sample_hash"] = priority_values(
+            candidate.source_token, candidate.source_row, self.seed
+        )
+        if not self.frame.empty:
+            candidate = pd.concat([self.frame, candidate], ignore_index=True)
+        candidate = candidate.nsmallest(self.limit, "_sample_hash", keep="all")
+        self.frame = candidate.sort_values(["_sample_hash", "source_token", "source_row"]).head(
+            self.limit
+        )
+
+    def metadata(self):
+        return super().metadata() | {"method": "smallest_splitmix64_source_row_v1"}
+
+
+class PopulationScaler:
+    """CPU counterpart of the native GPU float64 population reductions."""
+
+    def fit_transform(self, matrix):
+        self.mean_ = matrix.mean(axis=0, dtype=np.float64)
+        variance = np.square(matrix - self.mean_).mean(axis=0, dtype=np.float64)
+        self.scale_ = np.sqrt(variance)
+        constant = (matrix.max(axis=0) == matrix.min(axis=0)) | (self.scale_ == 0)
+        self.mean_[constant] = matrix[0, constant]
+        self.scale_[constant] = 1.0
+        return self.transform(matrix)
+
+    def transform(self, matrix):
+        return (matrix - self.mean_) / self.scale_
 
 
 def write_json(path: Path, value: dict) -> None:

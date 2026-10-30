@@ -5,6 +5,26 @@ implementations of defined computations. Neither a taxi record nor an aggregate
 zone connection reveals the street route, total travel demand, or a passenger's
 identity.
 
+## Execution modes
+
+The default `native` mode provides separate CPU and GPU implementations of the
+same analysis policy. GPU normalization, eligibility, features, bounded sampling,
+scaling, aggregations and anomaly baselines/scoring use cuDF/CuPy; clustering uses
+cuML and graph algorithms use cuGraph. The CPU path uses CPU libraries throughout.
+The manifest records actual stage backends, implementation descriptions and row
+counts. Host services remain responsible for checksums, metadata, small
+calendar/zone inputs, job control and reduced output finalization. Independent
+CPU reference checks are outside timed native GPU processing.
+
+The retained `legacy` mode describes the older hybrid implementation. Its CPU
+source preparation, sampling/scaling and anomaly calculations, plus an internal
+NetworkX graph reference, were included in GPU pipeline timings. The published
+historical 1.025× six-month ratio belongs to that mode. The separate completed
+native experiment measured 309.137 seconds CPU versus 36.499 seconds GPU at six
+months (8.470×), with three measured repetitions per backend and size. See the
+[native report](native-pipeline-results.md); its result applies to the recorded
+server, workload and timing scope.
+
 ## Sources and eligibility
 
 Monthly TLC Parquet files are retained with their byte count, SHA-256 checksum,
@@ -61,20 +81,38 @@ its anomaly model reports insufficient history or unavailable evaluation.
 
 ## Clustering
 
-KMeans uses four float32 features: `log1p(distance_miles)`,
+KMeans uses four features: `log1p(distance_miles)`,
 `log1p(duration_seconds)`, `sin(2π × pickup_hour / 24)`, and
 `cos(2π × pickup_hour / 24)`. Raw zone IDs are not numerical coordinates.
 
-A deterministic bounded sample keeps the smallest 64-bit BLAKE2b hashes of
-`seed:record_id`. The sample is independent of processing batch boundaries. Its
-identities, hash, eligible-row count, and sampling fraction are saved. The default
+Native execution computes features and training-only population mean/variance
+in float64, then forms standardized float32 KMeans matrices. A deterministic
+bounded sample keeps the smallest numeric SplitMix64 priorities derived from
+the source token, physical row number and seed, with source/row tie-breaking.
+CPU and GPU use the same policy, independent of batch boundaries. The saved
+policy name is `smallest_splitmix64_source_row_v1`. Sample identities, their hash,
+eligible-row count and sampling fraction are retained privately. The default
 training cap is 200,000 rows. Scaling is fitted only on those training rows.
 
+Legacy snapshots instead used the smallest 64-bit BLAKE2b hashes of
+`seed:record_id`. This policy change can change fitted models, so historical
+cluster labels and quality metrics are not assumed to remain identical.
+
 The pipeline fits the configured candidate cluster counts, normally 4, 6, and 8,
-using explicit seeded initial centers. The highest silhouette score on one fixed
+using explicit seeded initial centers. In native mode both backends take the
+first k rows under the same seeded numeric priority policy
+(`seeded_source_row_priority_first_k_v1`), after training-only scaling. The highest silhouette score on one fixed
 calibration sample selects the model; smaller k breaks ties. If a calibration
 score is unavailable, the smallest feasible k is retained as an exploratory
 choice. Test data never selects k or fits the scaler.
+
+The retained native model `kmeans-336273a6b0eac929` selected eight groups from a
+200,000-row training sample. Its 2,000-row May–June evaluation has silhouette
+0.283492 and mean squared center distance 1.133352 in standardized feature space.
+The earlier six-group model used a different sampling/initialization policy.
+Cluster IDs and metrics therefore do not carry unchanged across these revisions.
+Matched CPU/GPU inputs establish a comparable experiment, not identical fits or
+equal model quality; each measured trial's diagnostics are retained and displayed.
 
 Evaluation records held-out silhouette and center distance, cluster proportions,
 and adjusted Rand agreement for two additional seeds. Evaluation samples are
@@ -159,9 +197,11 @@ speedups. See `docs/gpu.md` for the custom CUDA path and its validation procedur
 
 ## Current analytical limits
 
-The core implements one feature set and a frozen seasonal detector. Location
-feature ablations, scale-floor sensitivity experiments, walk-forward updating,
-HVFHV, graph algorithms, weather corroboration, and manually reviewed incident
-cases are additional work. Public charts show recorded activity, sampled trip
+The core implements one clustering feature set, separate frozen pickup-count and
+mean-duration detectors, and weighted PageRank/Louvain graph analyses. Their
+extended definitions and benchmark scopes appear in [extended methods](extended-methods.md).
+Location feature ablations, scale-floor sensitivity experiments, walk-forward
+updating, HVFHV, weather corroboration and manually reviewed incident cases remain
+additional work. Public charts show recorded activity, sampled trip
 patterns, and statistical alerts. They do not establish congestion, fraud, latent
 demand, actual routes, or the cause of a change.

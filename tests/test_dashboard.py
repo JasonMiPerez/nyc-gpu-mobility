@@ -302,7 +302,8 @@ def test_sample_scatter_accepts_nullable_zone_ids(snapshot):
     assert len(scatter_sample(sample, 5000).data) == 2
 
 
-def test_public_export_is_bounded_and_omits_source_paths(snapshot, tmp_path):
+@pytest.mark.parametrize("backend", [None, "cpu", "gpu"])
+def test_public_export_is_bounded_and_omits_source_paths(snapshot, tmp_path, backend):
     from mobility.dashboard.static_export import export_public
 
     manifest = json.loads((snapshot / "manifest.json").read_text())
@@ -313,12 +314,36 @@ def test_public_export_is_bounded_and_omits_source_paths(snapshot, tmp_path):
             "local_path": "/private/secret/path",
         }
     ]
+    if backend:
+        manifest.update(
+            execution_mode="native",
+            execution_plan={
+                "volume_scoring": {
+                    "backend": backend,
+                    "implementation": "recorded scoring",
+                    "rows": 6,
+                },
+            },
+        )
+        manifest.setdefault("models", {})["graph"] = {"validation": {"status": "passed"}}
+        # External validation enriches the copied manifest; original diagnostics stay untouched.
+        (snapshot / "graph_analysis.json").write_text(
+            json.dumps({"validation": {"status": "awaiting_external_reference"}})
+        )
     (snapshot / "manifest.json").write_text(json.dumps(manifest))
     destination = export_public(snapshot, tmp_path / "public")
     assert (destination / "index.html").is_file()
     assert (destination / "plotly.min.js").stat().st_size > 1_000_000
     summary = json.loads((destination / "data/summary.json").read_text())
     assert sum(row["pickups"] or 0 for row in summary["zone_days"]) == 42
+    if backend:
+        assert summary["meta"]["execution_mode"] == "native"
+        assert summary["meta"]["execution_plan"]["volume_scoring"]["rows"] == 6
+        assert summary["meta"]["processing"]["anomaly_backend"] == backend
+        graph = json.loads((destination / "data/graph.json").read_text())
+        assert graph["metadata"]["validation"]["status"] == "passed"
+    else:
+        assert summary["meta"]["execution_mode"] == "legacy"
     patterns = json.loads((destination / "data/patterns.json").read_text())
     assert all("record_id" not in row for row in patterns["samples"])
     assert "/private/secret/path" not in (destination / "data/methods.json").read_text()

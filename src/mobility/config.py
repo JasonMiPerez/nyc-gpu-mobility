@@ -29,6 +29,7 @@ class DataConfig(StrictModel):
 
 class ProcessingConfig(StrictModel):
     backend: Literal["cpu", "gpu"] = "cpu"
+    execution_mode: Literal["native", "legacy"] = "native"
     cpu_threads: int = Field(4, ge=1, strict=True)
     batch_rows: int = Field(250_000, ge=100, le=5_000_000)
     gpu_memory_fraction: float = Field(0.65, gt=0, lt=1)

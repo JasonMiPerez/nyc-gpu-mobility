@@ -294,7 +294,9 @@ def _communities(groups, vertices, isolates):
     return {vertex: label for label, group in enumerate(groups) for vertex in group}, groups
 
 
-def analyze_graph(od_totals, zones, config, output_dir, backend="cpu") -> dict:
+def analyze_graph(
+    od_totals, zones, config, output_dir, backend="cpu", *, validate_cpu=True
+) -> dict:
     """Analyze one supplied period/source selection; never reread individual trips."""
     if backend not in ("cpu", "gpu"):
         raise ValueError("Graph backend must be cpu or gpu")
@@ -302,11 +304,19 @@ def analyze_graph(od_totals, zones, config, output_dir, backend="cpu") -> dict:
     nodes, edges, undirected, counts = _prepare(od_totals, zones, options)
     vertices = nodes.zone_id.tolist()
     modules = _require_gpu() if backend == "gpu" else None
-    cpu_ranks, cpu_groups, cpu_modularity, cpu_elapsed, projection = _cpu_algorithms(
-        vertices, edges, undirected, options
-    )
+    cpu_ranks, cpu_groups, cpu_modularity, cpu_elapsed, projection = (None, None, None, None, None)
+    if backend == "cpu" or validate_cpu:
+        cpu_ranks, cpu_groups, cpu_modularity, cpu_elapsed, projection = _cpu_algorithms(
+            vertices, edges, undirected, options
+        )
     ranks, groups, modularity, elapsed = cpu_ranks, cpu_groups, cpu_modularity, cpu_elapsed
     validation = {"status": "passed", "reference": "NetworkX CPU", "pagerank_max_abs_error": 0.0}
+    if backend == "gpu" and not validate_cpu:
+        validation = {
+            "status": "awaiting_external_reference",
+            "reference": "Separate CPU trial after timing",
+            "pagerank_max_abs_error": None,
+        }
     if backend == "gpu":
         ranks, groups, modularity, elapsed, device_counts = _gpu_algorithms(
             vertices, edges, undirected, options, modules
@@ -323,20 +333,25 @@ def analyze_graph(od_totals, zones, config, output_dir, backend="cpu") -> dict:
     if set(ranks) != set(vertices):
         raise ValueError("PageRank results must contain every mapped zone exactly once")
     values = np.array([ranks[v] for v in vertices], dtype="float64")
-    reference = np.array([cpu_ranks[v] for v in vertices], dtype="float64")
+    reference = (
+        np.array([cpu_ranks[v] for v in vertices], dtype="float64")
+        if cpu_ranks is not None
+        else None
+    )
     if not np.isfinite(values).all() or (values < 0).any():
         raise ValueError("PageRank returned invalid scores")
     if len(values) and not np.isclose(values.sum(), 1, atol=1e-6, rtol=0):
         raise ValueError("PageRank mass does not sum to one")
-    if not np.allclose(
+    if reference is not None and not np.allclose(
         values, reference, atol=options["pagerank_atol"], rtol=options["pagerank_rtol"]
     ):
         raise ValueError(
             "GPU PageRank differs from the NetworkX reference beyond declared tolerance"
         )
-    validation["pagerank_max_abs_error"] = (
-        float(np.max(np.abs(values - reference))) if len(values) else 0.0
-    )
+    if reference is not None:
+        validation["pagerank_max_abs_error"] = (
+            float(np.max(np.abs(values - reference))) if len(values) else 0.0
+        )
     labels, groups = _communities(groups, vertices, set(nodes.loc[nodes.is_isolated, "zone_id"]))
     checked_modularity = (
         float(
@@ -348,8 +363,8 @@ def analyze_graph(od_totals, zones, config, output_dir, backend="cpu") -> dict:
                 backend="networkx",
             )
         )
-        if not undirected.empty
-        else None
+        if not undirected.empty and projection is not None
+        else modularity
     )
     if modularity is not None and not np.isclose(
         modularity, checked_modularity, atol=1e-6, rtol=1e-5
@@ -381,7 +396,7 @@ def analyze_graph(od_totals, zones, config, output_dir, backend="cpu") -> dict:
         "modularity": checked_modularity,
         "cpu_reference_modularity": cpu_modularity,
         "modularity_difference_from_cpu": checked_modularity - cpu_modularity
-        if checked_modularity is not None
+        if checked_modularity is not None and cpu_modularity is not None
         else None,
         "compute_elapsed_s": elapsed,
         "cpu_reference_elapsed_s": cpu_elapsed,

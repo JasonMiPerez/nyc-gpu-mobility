@@ -37,6 +37,8 @@ def main():
         chart_checks = {}
         page.on("pageerror", lambda error: errors.append(str(error)))
         page.goto(args.url, wait_until="networkidle", timeout=60000)
+        summary = page.request.get(args.url.rstrip("/") + "/data/summary.json").json()
+        assert summary["meta"]["snapshot_id"] == snapshot.name
         expect(page.locator("#page-content")).to_contain_text(f"{expected_all:,}", timeout=60000)
         assert page.evaluate("typeof window.performance.now") == "function"
         for name in ["overview", "patterns", "zones", "anomalies", "performance", "methods"]:
@@ -112,6 +114,27 @@ def main():
                     )
                     expect(page.locator("#page-content")).to_contain_text("Sampled host peak (GiB)")
                     chart_checks["full_pipeline_scaling"] = True
+                    pipeline = page.request.get(
+                        args.url.rstrip("/") + "/data/pipeline-performance.json"
+                    ).json()
+                    quality = page.locator("#pipeline-section section.panel").filter(
+                        has=page.get_by_role("heading", name="Clustering quality by measured trial")
+                    )
+                    expect(quality.locator("tbody tr")).to_have_count(
+                        min(200, len(pipeline["clustering_quality"]))
+                    )
+                    expect(quality).to_contain_text("Test silhouette")
+                    expect(quality).to_contain_text("Unavailable")
+                    chart_checks["clustering_quality_trials"] = len(pipeline["clustering_quality"])
+                    evidence = pipeline["cpu_execution_evidence"]
+                    count = evidence["measured_native_cpu_trials"]
+                    if count:
+                        assert evidence["guard_and_no_cuda_imports_confirmed"] == count
+                        assert evidence["zero_sampled_gpu_memory_trials"] == count
+                        expect(page.locator("#pipeline-section")).to_contain_text(
+                            f"Native CPU isolation: {count} of {count}"
+                        )
+                        chart_checks["native_cpu_isolation_trials"] = count
             records.append({"page": name, "elapsed_s": round(time.perf_counter() - started, 3)})
             page.screenshot(path=str(output / f"public-{name}.png"), full_page=True)
         page.locator('button[data-page="overview"]').click()
@@ -138,6 +161,8 @@ def main():
         assert widths["content"] <= widths["viewport"], widths
         assert not errors, errors
         report = {
+            "url": args.url,
+            "snapshot_id": snapshot.name,
             "pages": records,
             "errors": errors,
             "mobile_widths": widths,

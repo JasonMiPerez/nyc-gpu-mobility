@@ -64,10 +64,10 @@ def to_device(frame):
 
 
 def derive_features(frame, config=None):
-    """Derive numerical features on device after CPU source/time validation.
+    """Derive device features while preserving canonical quality/eligibility.
 
-    The canonical eligibility and quality fields are preserved. This stage does
-    not claim that timezone normalization or source adaptation occurred on GPU.
+    Native production supplies GPU-normalized columns; the explicit legacy
+    adapter can also transfer CPU-normalized columns with the same schema.
     """
     cp = require_cupy()
     cudf = require_cudf()
@@ -135,7 +135,7 @@ def derive_features(frame, config=None):
 
 
 def aggregate(frame):
-    """Return GPU partial sums/counts; the caller transfers the small results.
+    """Return GPU partial sums/counts for continued device aggregation.
 
     Pickup and drop-off time bins are independent. Duration and distance
     statistics are pickup-anchored. Coverage grids are built after merging.

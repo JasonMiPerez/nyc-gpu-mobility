@@ -243,13 +243,69 @@ def test_pipeline_ratio_uses_valid_measured_matching_protocols(extended_snapshot
 def test_methods_follow_snapshot_capabilities_and_backend(extended_snapshot):
     repo = SnapshotRepository(extended_snapshot)
     text = component_text(render_page(repo, "methods", repo.default_filters()))
-    assert "processing backend is gpu" in text
+    assert "aggregations: gpu" in text
+    assert "Historical execution" in text
     assert "Graph analysis backend: gpu" in text
     assert "weighted PageRank and Louvain" in text
     assert "Duration computation: CPU pandas/numpy" in text
     assert "six-month published analysis was built on CPU" not in text
     assert "cuGraph algorithms are not implemented" not in text
     assert "does not yet detect unusual trip durations" not in text
+
+
+@pytest.mark.parametrize("backend", ["cpu", "gpu"])
+def test_native_methods_follow_actual_stage_evidence(extended_snapshot, backend):
+    repo = SnapshotRepository(extended_snapshot)
+    repo.manifest["execution_mode"] = "native"
+    repo.manifest["execution_plan"] = {
+        stage: {"backend": backend, "implementation": "native implementation", "rows": 100}
+        for stage in ["aggregation", "kmeans_fit", "volume_scoring", "duration_scoring", "graph"]
+    }
+    text = component_text(render_page(repo, "methods", repo.default_filters()))
+    assert f"pickup-volume anomalies: {backend}" in text
+    assert f"duration anomalies: {backend}" in text
+    assert "Native execution" in text
+    assert "Historical execution" not in text
+    assert "after timed GPU processing" in text
+
+
+def test_native_pipeline_timing_note_does_not_inherit_legacy_cpu_reference():
+    from mobility.dashboard.app import _pipeline_execution_note
+
+    native = pd.DataFrame([{"stage": "native_production_pipeline", "execution_mode": "native"}])
+    old = pd.DataFrame([{"stage": "production_pipeline"}])
+    assert "after timing" in _pipeline_execution_note(native, {})
+    assert "CPU reference remains timed" not in _pipeline_execution_note(native, {})
+    assert "CPU reference remains timed" in _pipeline_execution_note(old, {})
+
+
+def test_pipeline_displays_recorded_model_quality_alongside_timing(extended_snapshot):
+    path = extended_snapshot / "pipeline_benchmark_runs.parquet"
+    trials = pd.read_parquet(path)
+    trials["model_quality_json"] = json.dumps(
+        {
+            "clustering": {
+                "selected_k": 6,
+                "status": "calibration_selected",
+                "test_status": "evaluated",
+                "candidates": [
+                    {"k": 6, "training_rows": 100, "training_inertia_per_row": 0.812345}
+                ],
+                "test": {
+                    "rows": 50,
+                    "silhouette": 0.345678,
+                    "mean_squared_center_distance": 0.987654,
+                },
+            }
+        }
+    )
+    trials.to_parquet(path, index=False)
+    repo = SnapshotRepository(extended_snapshot)
+    text = component_text(render_page(repo, "performance", repo.default_filters()))
+    assert "Clustering quality by measured trial" in text
+    assert "0.812345" in text and "0.345678" in text and "0.987654" in text
+    assert "do not guarantee identical fitted clusters or equal model quality" in text
+    assert "have no April calibration or May–June test data" in text
 
 
 def test_older_snapshots_keep_explicit_unpublished_feature_states(extended_snapshot):
