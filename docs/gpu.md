@@ -10,7 +10,11 @@ The web dashboard needs only the CPU environment and published artifacts.
 for numerical features. Source adaptation, calendar/DST decisions and quality
 eligibility are prepared on the CPU. Their time and the transfer belong in a
 pipeline measurement. There is no automatic CPU fallback for a requested GPU run.
-Clustering has its own optional cuML implementation in `mobility.models`.
+Clustering has its own cuML implementation in `mobility.models`. Zone-network
+analysis uses cuGraph for weighted directed PageRank and weighted undirected
+Louvain communities, with NetworkX correctness checks. Both anomaly detectors
+currently use CPU calculations. ML feature/scaler preparation also remains CPU
+work; the published metadata distinguishes these stages.
 
 `processing.custom_cuda: true` selects the fused custom feature kernel during a
 yellow-taxi GPU pipeline. With `false`, ordinary GPU library operations are used.
@@ -51,7 +55,7 @@ at wall-clock boundaries and use CUDA events for kernel-only work.
 Observed server: Ubuntu 20.04, glibc 2.31, NVIDIA TITAN RTX (Turing 7.5, 24 GB),
 driver 535.183.01. The project environment is isolated under `.gpu-env`; it does
 not change drivers or system Python. The selected compatibility target is
-RAPIDS 25.10, Python 3.12, CUDA/NVRTC/nvcc package selection 12.2, CuPy 13.6 and scikit-learn
+RAPIDS 25.10 (including cuGraph 25.10.01), Python 3.12, CUDA/NVRTC/nvcc package selection 12.2, CuPy 13.6 and scikit-learn
 1.7.2. The older sklearn pin is necessary for cuML 25.10's internal API usage;
 the initially resolved sklearn 1.9 failed the import smoke test. Direct CUDA
 driver API returned version 12020; `CONDA_OVERRIDE_CUDA=12.2` was used because
@@ -114,6 +118,37 @@ by the administrator. Save their output, tool version and exit code. Do not use
 heavily instrumented profiling runs as final timing trials.
 
 ## Benchmark API and interpretation
+
+The full study can be run with all implemented analyses:
+
+```sh
+python -m mobility --config configs/gpu-six-month.yaml pipeline run --publish
+```
+
+The broader benchmark runs complete production pipelines on the same host:
+
+```sh
+python scripts/benchmark_pipeline_scaling.py \
+  --root "$PWD" --config configs/default.yaml \
+  --output artifacts/new-pipeline-experiment \
+  --month-counts 1 3 6 --repeats 3 --warmups 1 --cpu-threads 4 --keep-runs
+```
+
+Use a new output directory. These trials include raw-source normalization,
+artifact writes, cuML/CPU clustering, both anomaly detectors and graph analysis.
+The expensive per-batch CPU aggregate reference is disabled during timing;
+complete outputs and model inputs are compared afterward. Built-in source and
+count reconciliation and the graph's CPU reference remain timed. Graph checks
+do not assume the same Louvain partition on both backends. One/three-month runs
+lack the later calibration/test data available to the six-month run.
+
+Each trial is a fresh process. Requested sampling intervals are 10 ms for host
+process-tree RSS and 20 ms for GPU process memory; actual gaps and missing readings
+are retained. These are sampled peaks, not guaranteed high-water marks. Desktop
+GPU services remain running and are disclosed as background activity. See
+[extended methods](extended-methods.md) for the complete measurement contract.
+
+The smaller stage-level benchmark remains available separately:
 
 `run_benchmarks(canonical_dir, output_dir, config, include_gpu=False)` runs actual
 available canonical records. Set `include_gpu=True` explicitly on the NVIDIA

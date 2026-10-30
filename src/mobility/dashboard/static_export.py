@@ -66,6 +66,9 @@ def _model_summary(models: dict) -> dict:
         "computation_backend",
         "score_meaning",
         "manual_review_status",
+        "unit",
+        "baseline_meaning",
+        "limitations",
     }
     # These structures are generated explanations and numeric policy values.
     # Training samples, record identities, paths and software environments stay private.
@@ -75,6 +78,8 @@ def _model_summary(models: dict) -> dict:
         "splits",
         "anomalies_config",
         "calibration",
+        "duration_anomalies_config",
+        "trip_filter_thresholds",
     }
     return {
         name: {
@@ -126,13 +131,15 @@ def _hour_profile(hours: pd.DataFrame) -> list[dict]:
     return _records(grouped.rename(columns={"mean": "mean_pickups", "count": "observed_hours"}))
 
 
-def _anomalies(repo: SnapshotRepository) -> dict:
+def _anomalies(repo: SnapshotRepository, prefix="anomaly") -> dict:
     scores = (
-        repo.read("anomaly_scores", repo.default_filters())
-        if repo.has("anomaly_scores")
+        repo.read(f"{prefix}_scores", repo.default_filters())
+        if repo.has(f"{prefix}_scores")
         else pd.DataFrame()
     )
-    incidents = repo.read("anomaly_incidents")
+    incidents = (
+        repo.read(f"{prefix}_incidents") if repo.has(f"{prefix}_incidents") else pd.DataFrame()
+    )
     result = {
         "alerts": [],
         "incidents": [],
@@ -161,6 +168,7 @@ def _anomalies(repo: SnapshotRepository) -> dict:
                 "total_deviation",
                 "baseline_support_min",
                 "label",
+                "split",
             ],
         )
     if scores.empty:
@@ -186,6 +194,7 @@ def _anomalies(repo: SnapshotRepository) -> dict:
             "direction",
             "status",
             "split",
+            "eligible_trip_count",
         ],
     )
     for index, row in enumerate(alerts.itertuples()):
@@ -195,6 +204,17 @@ def _anomalies(repo: SnapshotRepository) -> dict:
             & (pd.to_datetime(scores.hour) >= hour - pd.Timedelta(hours=48))
             & (pd.to_datetime(scores.hour) <= hour + pd.Timedelta(hours=48))
         ].sort_values("hour")
+        if prefix == "duration":
+            # Missing duration observations are gaps, not zero-minute trips or
+            # a line interpolated across unsupported/missing hours.
+            context = context.set_index("hour").reindex(
+                pd.date_range(
+                    hour - pd.Timedelta(hours=48), hour + pd.Timedelta(hours=48), freq="h"
+                )
+            )
+            context.index.name = "hour"
+            context = context.reset_index()
+            context.loc[context.status.ne("scored"), ["observed", "baseline"]] = float("nan")
         result["contexts"][str(index)] = _records(
             context, ["hour", "observed", "baseline", "is_alert", "status"]
         )
@@ -202,16 +222,19 @@ def _anomalies(repo: SnapshotRepository) -> dict:
     return result
 
 
-def _benchmark_payload(repo: SnapshotRepository, trials: pd.DataFrame) -> dict:
+def _benchmark_payload(repo: SnapshotRepository, trials: pd.DataFrame, *, pipeline=False) -> dict:
     comparisons = []
     if not trials.empty:
         valid = trials[pd.to_numeric(trials.elapsed_s, errors="coerce").gt(0)]
         valid = valid[
             valid.validation.astype(str).str.lower().isin(["passed", "pass", "true", "ok"])
         ]
+        if "phase" in valid:
+            valid = valid[valid.phase.eq("measured")]
+        protocol = "protocol_hash" if "protocol_hash" in valid else "config_hash"
         keys = [
             key
-            for key in ["experiment_id", "stage", "timing_scope", "input_rows", "config_hash"]
+            for key in ["experiment_id", "stage", "timing_scope", "input_rows", protocol]
             if key in valid
         ]
         if keys and not valid.empty:
@@ -259,13 +282,36 @@ def _benchmark_payload(repo: SnapshotRepository, trials: pd.DataFrame) -> dict:
                 "scope_detail",
                 "cache_condition",
                 "memory_measurement",
+                "protocol_hash",
+                "phase",
+                "months",
+                "month_count",
+                "peak_gpu_memory_sampled_bytes",
+                "gpu_sample_interval_s",
+                "rss_samples",
+                "gpu_samples",
+                "rss_process_tree_complete",
+                "rss_max_observed_gap_s",
+                "gpu_max_observed_gap_s",
+                "rss_sampling_errors",
+                "gpu_sampling_errors",
+                "resource_status",
+                "gpu_background_processes",
+                "background_gpu_processes",
+                "selected_k",
+                "cluster_eligible_rows",
+                "validation_elapsed_s",
             ],
             precision=12,
         ),
         "total_trials": len(trials),
         "display_limit": 2000,
         "comparisons": comparisons,
-        "environment": _public_environment(repo.manifest.get("benchmark_environment", {})),
+        "environment": _public_environment(
+            repo.manifest.get(
+                "pipeline_benchmark_environment" if pipeline else "benchmark_environment", {}
+            )
+        ),
     }
 
 
@@ -295,9 +341,29 @@ def _public_environment(environment: dict) -> dict:
         "status",
         "warm_initialization_s",
         "gpu",
+        "requested_month_counts",
+        "repeats",
+        "warmups",
+        "cpu_threads",
+        "timing_scope",
+        "resource_notes",
+        "validation_notes",
+        "model_notes",
     }
     result = {key: value for key, value in environment.items() if key in allowed}
     settings = environment.get("config", {})
+    if "benchmark" in settings:
+        settings = settings["benchmark"]
+    # The full-pipeline CLI can override the project defaults. Publish its actual
+    # protocol, rather than showing the older stage benchmark's repetition count.
+    settings = {
+        **settings,
+        **{
+            key: environment[key]
+            for key in ["warmups", "repeats", "cpu_threads", "seed"]
+            if key in environment
+        },
+    }
     result["config"] = {
         key: value
         for key, value in settings.items()
@@ -396,6 +462,7 @@ def export_public(snapshot_dir: Path, destination_dist: Path) -> Path:
         "study_start": repo.manifest["study_start"],
         "study_end": repo.manifest["study_end"],
         "dataset": repo.default_filters().dataset,
+        "raw_rows": repo.manifest.get("raw_rows"),
         "models": _model_summary(repo.manifest.get("models", {})),
         "splits": repo.manifest.get("config", {}).get("splits", {}),
         "anomaly_parameters": repo.manifest.get("config", {}).get("anomalies", {}),
@@ -407,6 +474,8 @@ def export_public(snapshot_dir: Path, destination_dist: Path) -> Path:
             .get("clustering", {})
             .get("backend", "unknown"),
             "anomaly_backend": "cpu",
+            "duration_anomaly_backend": "cpu" if repo.has("duration_scores") else None,
+            "graph_backend": repo.manifest.get("models", {}).get("graph", {}).get("backend"),
             "browser_execution": "Precomputed snapshot; no GPU jobs run in the browser.",
         },
         "time_convention": "America/New_York — source local wall time",
@@ -452,7 +521,39 @@ def export_public(snapshot_dir: Path, destination_dist: Path) -> Path:
             "scope": "fixed_full_snapshot_period",
         },
         "anomalies.json": _anomalies(repo),
+        "duration-anomalies.json": _anomalies(repo, "duration"),
+        "graph.json": {
+            "nodes": _records(
+                repo.read("graph_nodes"),
+                [
+                    "zone_id",
+                    "zone",
+                    "borough",
+                    "pagerank",
+                    "community",
+                    "in_degree",
+                    "out_degree",
+                    "degree",
+                    "in_trip_strength",
+                    "out_trip_strength",
+                    "self_trip_count",
+                    "is_isolated",
+                ],
+                precision=12,
+            )
+            if repo.has("graph_nodes")
+            else [],
+            "metadata": repo.manifest.get("models", {}).get("graph", {}),
+            "scope": "fixed_full_snapshot_period",
+        },
         "performance.json": _benchmark_payload(repo, trials),
+        "pipeline-performance.json": _benchmark_payload(
+            repo,
+            repo.read("pipeline_benchmark_runs")
+            if repo.has("pipeline_benchmark_runs")
+            else pd.DataFrame(),
+            pipeline=True,
+        ),
         "methods.json": {
             "sources": public_sources,
             "quality": _records(quality.head(2000)),

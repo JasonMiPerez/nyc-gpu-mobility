@@ -69,6 +69,9 @@ def test_performance_reports_cpu_win_and_preserves_small_times():
     class Repository:
         manifest = {}
 
+        def has(self, name):
+            return False
+
         def read(self, name):
             return pd.DataFrame(
                 {

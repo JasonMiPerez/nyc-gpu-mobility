@@ -229,22 +229,24 @@ def run_pipeline(root: Path, config: dict, *, fit_models: bool = True) -> Path:
                     zone_part, od_part = gpu.aggregate(device)
                     gpu.synchronize()
                     zone_part, od_part = zone_part.to_pandas(), od_part.to_pandas()
-                    # Every GPU batch is checked against its independent CPU reference.
-                    cpu_zone, cpu_od = aggregate_cpu(frame)
-                    for actual, reference, keys in [
-                        (zone_part, cpu_zone, ZONE_KEYS),
-                        (od_part, cpu_od, OD_KEYS),
-                    ]:
-                        a = actual.sort_values(keys).reset_index(drop=True)
-                        b = reference.sort_values(keys).reset_index(drop=True)
-                        pd.testing.assert_frame_equal(
-                            a[b.columns],
-                            b,
-                            check_dtype=False,
-                            check_exact=False,
-                            rtol=1e-9,
-                            atol=1e-7,
-                        )
+                    if config["processing"].get("verify_gpu_batches", True):
+                        # Production validation checks each batch. Matched benchmarks
+                        # compare complete CPU/GPU outputs after their timed windows.
+                        cpu_zone, cpu_od = aggregate_cpu(frame)
+                        for actual, reference, keys in [
+                            (zone_part, cpu_zone, ZONE_KEYS),
+                            (od_part, cpu_od, OD_KEYS),
+                        ]:
+                            a = actual.sort_values(keys).reset_index(drop=True)
+                            b = reference.sort_values(keys).reset_index(drop=True)
+                            pd.testing.assert_frame_equal(
+                                a[b.columns],
+                                b,
+                                check_dtype=False,
+                                check_exact=False,
+                                rtol=1e-9,
+                                atol=1e-7,
+                            )
                 else:
                     zone_part, od_part = aggregate_cpu(frame)
                 zone_parts.append(zone_part)
@@ -356,6 +358,10 @@ def run_pipeline(root: Path, config: dict, *, fit_models: bool = True) -> Path:
             tables=tables,
             models=model_result.get("models", {}),
             model_status=model_result.get("status"),
+            gpu_batch_reference_checks=(
+                config["processing"]["backend"] == "gpu"
+                and config["processing"].get("verify_gpu_batches", True)
+            ),
             validation=validation,
             row_counts=validation["counts"],
             pipeline_timings=timings,

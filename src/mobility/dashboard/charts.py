@@ -175,6 +175,68 @@ def heatmap(frame: pd.DataFrame) -> go.Figure:
     return style(figure)
 
 
+def graph_zone_map(
+    nodes: pd.DataFrame,
+    zones: pd.DataFrame,
+    geojson: dict | None,
+    metric="pagerank",
+    revision="mobility",
+    tiles=False,
+) -> go.Figure:
+    """Show continuous PageRank or categorical communities without ranking labels."""
+    if nodes.empty or metric not in nodes:
+        return empty("Graph results are unavailable for this snapshot.")
+    data = nodes.copy()
+    missing = [column for column in zones if column not in data and column != "zone_id"]
+    if missing:
+        data = data.merge(zones[["zone_id", *missing]], on="zone_id", how="left")
+    if "zone" not in data:
+        data["zone"] = data["zone_id"].astype(str)
+    arguments = {
+        "hover_name": "zone",
+        "custom_data": ["zone_id"],
+        "hover_data": [name for name in ["pagerank", "degree", "community"] if name in data],
+        "center": {"lat": 40.74, "lon": -73.96},
+        "zoom": 9.4,
+    }
+    if metric == "community":
+        data["community_label"] = data["community"].map(
+            lambda value: "Unavailable" if pd.isna(value) else f"Group {int(value)}"
+        )
+        arguments.update(
+            color="community_label",
+            color_discrete_sequence=px.colors.qualitative.Alphabet,
+            labels={"community_label": "Community label"},
+        )
+    else:
+        arguments.update(
+            color="pagerank",
+            color_continuous_scale=["#eef3ff", "#9bb8ed", BLUE, "#142b6f"],
+            labels={"pagerank": "PageRank score"},
+        )
+    if geojson:
+        figure = px.choropleth_map(
+            data,
+            geojson=geojson,
+            locations="zone_id",
+            featureidkey="properties.zone_id",
+            opacity=0.85,
+            **arguments,
+        )
+    elif {"latitude", "longitude"}.issubset(data.columns):
+        data = data.dropna(subset=["latitude", "longitude"])
+        if data.empty:
+            return empty("Zone geometry is unavailable; use the graph table.")
+        figure = px.scatter_map(data, lat="latitude", lon="longitude", **arguments)
+        figure.update_traces(marker_size=11)
+    else:
+        return empty("Zone geometry is unavailable; use the graph table.")
+    figure.update_layout(map_style="carto-positron" if tiles else "white-bg")
+    if metric == "pagerank":
+        figure.update_layout(coloraxis_colorbar=dict(title="PageRank", thickness=12, len=0.65))
+    return style(figure, height=470, revision=revision)
+
+
 def flows(data: pd.DataFrame, zones: pd.DataFrame, limit: int, tiles=False) -> go.Figure:
     if data.empty or not {"longitude", "latitude"}.issubset(zones.columns):
         return empty("No mapped OD connections match these filters.")
@@ -360,7 +422,9 @@ def sample_distance_histogram(data: pd.DataFrame) -> go.Figure:
     return figure
 
 
-def anomaly_context(data: pd.DataFrame, zone: int, selected_hour: str) -> go.Figure:
+def anomaly_context(
+    data: pd.DataFrame, zone: int, selected_hour: str, metric="pickup_count"
+) -> go.Figure:
     hour = pd.Timestamp(selected_hour)
     subset = data[
         (data.zone_id == zone)
@@ -369,15 +433,34 @@ def anomaly_context(data: pd.DataFrame, zone: int, selected_hour: str) -> go.Fig
     ].sort_values("hour")
     if subset.empty:
         return empty("No scored context is available for this selection.")
+    duration = metric == "mean_duration_minutes"
+    if duration:
+        # Sparse duration artifacts omit missing hours. Explicit gaps prevent a
+        # line from implying observations between two nonadjacent recorded hours.
+        subset = subset.set_index("hour").reindex(
+            pd.date_range(subset.hour.min(), subset.hour.max(), freq="h")
+        )
+        subset.index.name = "hour"
+        subset = subset.reset_index()
     figure = go.Figure()
+    observation_options = {}
+    if duration and "eligible_trip_count" in subset:
+        observation_options = {
+            "customdata": subset[["eligible_trip_count", "status"]].to_numpy(dtype=object),
+            "hovertemplate": (
+                "%{x}<br>Mean duration: %{y:.2f} min<br>Eligible trips: %{customdata[0]}"
+                "<br>%{customdata[1]}<extra></extra>"
+            ),
+        }
     figure.add_trace(
         go.Scatter(
             x=subset.hour,
             y=subset.observed,
-            name="Observed pickups",
+            name="Mean eligible trip duration" if duration else "Observed pickups",
             mode="lines",
             line=dict(color=BLUE, width=2.5),
             connectgaps=False,
+            **observation_options,
         )
     )
     figure.add_trace(
@@ -401,6 +484,8 @@ def anomaly_context(data: pd.DataFrame, zone: int, selected_hour: str) -> go.Fig
         )
     )
     figure.update_layout(
-        yaxis_title="Recorded pickups", xaxis_title="NYC source local time", hovermode="x unified"
+        yaxis_title="Mean trip duration (minutes)" if duration else "Recorded pickups",
+        xaxis_title="NYC source local time",
+        hovermode="x unified",
     )
     return style(figure, height=380)

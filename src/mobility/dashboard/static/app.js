@@ -20,7 +20,7 @@ const pages = {
   ],
   anomalies: [
     "Unusual activity",
-    "Compare recorded pickups with their seasonal baseline.",
+    "Compare pickup volume and trip duration with their historical baselines.",
   ],
   performance: [
     "CPU & GPU performance",
@@ -147,6 +147,83 @@ function modelSplits() {
     calibration_start: "2024-04-01", calibration_end: "2024-05-01",
     test_start: "2024-05-01", test_end: "2024-07-01",
   };
+}
+
+function alertDefinition(metric, meta, data) {
+  const duration = metric === "duration";
+  const model = meta.models?.[duration ? "duration_anomalies" : "anomalies"] || {};
+  const parameters = duration ? model.duration_anomalies_config || {} :
+    model.anomalies_config || meta.anomaly_parameters || model.parameters || {};
+  return {
+    duration,
+    model,
+    unit: duration ? "minutes" : "pickups",
+    observedLabel: duration ? "Mean duration (minutes)" : "Observed pickups",
+    baselineLabel: duration ? "Baseline minutes" : "Baseline pickups",
+    scoreThreshold: model.threshold ?? data.alerts?.[0]?.threshold ?? parameters.score_threshold ?? 4,
+    absoluteThreshold: duration ? parameters.absolute_threshold_minutes ?? 5 : parameters.absolute_threshold ?? 20,
+    scaleFloor: duration ? parameters.scale_floor_minutes ?? 2 : parameters.scale_floor ?? 5,
+    minHistory: parameters.min_history ?? 8,
+    minTrips: duration ? parameters.min_trips_per_hour ?? 20 : null,
+    splits: model.splits || meta.splits || modelSplits(),
+  };
+}
+
+function backendLabel(value) {
+  return typeof value === "string" && value ? value.toUpperCase() : "Not published";
+}
+
+function processingDescription(meta) {
+  const processing = meta.processing || {};
+  return `<p>This snapshot contains <strong>${number(meta.raw_rows)} raw source records</strong>. Saved result backends: <strong>aggregations ${escapeHtml(backendLabel(processing.aggregation_backend))}</strong>, <strong>trip clustering ${escapeHtml(backendLabel(processing.clustering_backend))}</strong>, <strong>pickup-volume anomalies ${escapeHtml(backendLabel(processing.anomaly_backend))}</strong>, <strong>duration anomalies ${escapeHtml(backendLabel(processing.duration_anomaly_backend))}</strong>, and <strong>graph analysis ${escapeHtml(backendLabel(processing.graph_backend))}</strong>.</p><p>The GPU implementation uses CUDA/CuPy trip features, cuDF filtering and aggregations, cuML clustering, and cuGraph PageRank/Louvain when the corresponding backend above is GPU. Source/schema/time validation, model feature scaling, anomaly calculations and bounded graph preparation use CPU work. Viewing this website displays saved results and starts no GPU jobs.</p>`;
+}
+
+function communityPalette(nodes) {
+  const labels = [...new Set(nodes.filter((row) => !row.is_isolated && row.community != null).map((row) => Number(row.community)))].sort((a, b) => a - b);
+  return new Map(labels.map((label, index) => [label, colors[index] || `hsl(${(index * 137.508) % 360}, 65%, 42%)`]));
+}
+
+function validatedMeasured(rows) {
+  return rows.filter((row) => row.phase === "measured" && Number.isFinite(row.elapsed_s) && row.elapsed_s > 0 &&
+    ["passed", "pass", "true", "ok"].includes(String(row.validation).toLowerCase()));
+}
+
+function pipelineMedians(rows) {
+  const groups = new Map();
+  for (const row of validatedMeasured(rows)) {
+    const key = JSON.stringify([row.experiment_id, row.protocol_hash, row.stage, row.timing_scope, row.input_rows, row.backend]);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  return [...groups.values()].map((values) => {
+    const times = values.map((row) => row.elapsed_s).sort((a, b) => a - b);
+    const middle = Math.floor(times.length / 2);
+    return { ...values[0], elapsed_s: times.length % 2 ? times[middle] : (times[middle - 1] + times[middle]) / 2,
+      repetitions: times.length, minimum_s: times[0], maximum_s: times[times.length - 1] };
+  });
+}
+
+function memoryGiB(value) {
+  return Number.isFinite(value) && value >= 0 ? number(value / 2 ** 30, 3) : "Unavailable";
+}
+
+function pipelineResourceRow(row) {
+  const background = row.background_gpu_processes ?? row.gpu_background_processes;
+  return {
+    ...row,
+    elapsed_s: number(row.elapsed_s, 6),
+    host_gib: memoryGiB(row.peak_host_rss_sampled_bytes),
+    gpu_gib: memoryGiB(row.peak_gpu_memory_sampled_bytes),
+    rss_interval_ms: Number.isFinite(row.rss_sample_interval_s) ? number(row.rss_sample_interval_s * 1000, 1) : "Unavailable",
+    gpu_interval_ms: Number.isFinite(row.gpu_sample_interval_s) ? number(row.gpu_sample_interval_s * 1000, 1) : "Unavailable",
+    background: background == null ? "Not recorded" : typeof background === "boolean" ? (background ? "Observed" : "None observed") : Array.isArray(background) ? `${background.length} observed` : escapeHtml(background),
+    months: row.months ?? row.month_count,
+  };
+}
+
+function environmentDetails(environment) {
+  const gpu = environment?.gpu?.gpu || environment?.gpu?.name || "Not recorded";
+  return `<p>GPU: <strong>${escapeHtml(gpu)}</strong>. Host RAM: <strong>${memoryGiB(environment?.host_memory_bytes)} GiB</strong>. CPU cores: <strong>${number(environment?.cpu_physical_cores)} physical / ${number(environment?.cpu_logical_cores)} logical</strong>. Configured CPU threads: <strong>${number(environment?.config?.cpu_threads)}</strong>.</p><details class="technical-details"><summary>Hardware, software and experiment settings</summary><pre class="code-block">${escapeHtml(JSON.stringify(environment || {}, null, 2))}</pre></details>`;
 }
 
 function table(rows, columns, limit = 100) {
@@ -676,8 +753,73 @@ async function patterns(request) {
   drawSample();
 }
 
+async function renderGraph(data, request) {
+  if (!data?.nodes?.length || !byId("graph-section")) {
+    if (byId("graph-section")) byId("graph-section").innerHTML = panel("Zone network analysis", notice("Graph results have not been published for this snapshot."));
+    return;
+  }
+  const metadata = data.metadata || {};
+  const rows = [...data.nodes].sort((a, b) => b.pagerank - a.pagerank);
+  const palette = communityPalette(rows);
+  byId("graph-section").innerHTML =
+    panel("Zone network analysis",
+      notice(`Fixed full-period graph: ${number(metadata.mapped_zone_count ?? rows.length)} mapped zones, ${number(metadata.directed_edge_count)} directed cross-zone pairs, ${number(metadata.retained_trip_count)} retained trips. Backend: ${backendLabel(metadata.backend)}. Origin, destination and top-pair controls above do not change these results.`) +
+      `<p><strong>PageRank</strong> measures a zone's incoming network connectivity, taking the strengths of its incoming connections into account. Edge weights are recorded trip counts; the scores sum to one across all mapped zones. PageRank is not a trip count.</p><p><strong>Louvain communities</strong> group zones with strong weighted connections. For this calculation, A → B and B → A are added into one undirected pair. Colors and group numbers are categories, not a ranking, and the groups need not match borough boundaries.</p><div class="graph-controls"><label for="graph-view">Color the zone map by</label><select id="graph-view"><option value="community">Louvain community</option><option value="pagerank">PageRank connectivity</option></select></div>${chartDiv("graph-map")}<div id="graph-legend" class="community-legend" aria-label="Community colors"></div>`,
+      `Directed pairs require at least ${number(metadata.parameters?.min_trips_per_edge ?? 1)} trips after aggregation. ${number(metadata.self_trip_count)} within-zone trips are reported separately and excluded from both graph algorithms. ${number(metadata.isolated_zone_count)} zones have no retained cross-zone edge; they remain included. This small zone graph does not imply a GPU speed advantage.`) +
+    panel("Zone connectivity and communities", table(rows.map((row) => ({
+      ...row, zone: row.zone || zoneName(row.zone_id), pagerank: number(row.pagerank, 6),
+      community_label: row.is_isolated ? "Isolated" : `Group ${Number(row.community) + 1}`,
+    })), [
+      ["zone", "Zone"], ["borough", "Borough"], ["pagerank", "PageRank"], ["community_label", "Community"],
+      ["in_degree", "Origins linked in"], ["out_degree", "Destinations linked out"],
+      ["in_trip_strength", "Incoming cross-zone trips"], ["out_trip_strength", "Outgoing cross-zone trips"],
+      ["self_trip_count", "Within-zone trips"],
+    ], 50) + `<p class="artifact-links"><a href="data/graph.json">Download all mapped zones and graph definitions</a></p>`,
+      `The top ${Math.min(50, rows.length)} of ${number(rows.length)} mapped zones by PageRank; the map includes all zones. In/out degree counts distinct connected zones; strength counts trips. Weighted undirected modularity: ${number(metadata.modularity, 3)}. Community labels can differ across CPU and GPU runs.`);
+  const geometry = await load("zones.geojson", true);
+  if (request !== state.request || !byId("graph-view")) return;
+  function drawGraph() {
+    const community = byId("graph-view").value === "community";
+    const anchors = new Map(state.summary.zones.map((row) => [Number(row.zone_id), row]));
+    const groups = community ? [...groupRows(rows, "community")].map(([label, values]) => ({
+      name: values.every((row) => row.is_isolated) ? "Isolated zone" : `Group ${Number(label) + 1}`,
+      values, color: values.every((row) => row.is_isolated) ? "#8793a4" : palette.get(Number(label)),
+    })) : [{ name: "PageRank", values: rows }];
+    const traces = groups.map((group) => {
+      const values = geometry ? group.values : group.values.filter((row) => {
+        const point = anchors.get(Number(row.zone_id));
+        return Number.isFinite(point?.longitude) && Number.isFinite(point?.latitude);
+      });
+      const hover = values.map((row) => [escapeHtml(row.zone || zoneName(row.zone_id)), row.pagerank,
+        row.in_trip_strength, row.out_trip_strength, row.is_isolated ? "Isolated" : `Group ${Number(row.community) + 1}`]);
+      const trace = { name: group.name, customdata: hover, showlegend: false,
+        hovertemplate: "%{customdata[0]}<br>PageRank %{customdata[1]:.6f}<br>%{customdata[4]}<br>Incoming trips %{customdata[2]:,}<br>Outgoing trips %{customdata[3]:,}<extra></extra>" };
+      if (geometry) return { ...trace, type: "choroplethmap", geojson: geometry,
+        featureidkey: "properties.zone_id", locations: values.map((row) => row.zone_id),
+        z: values.map((row) => community ? 1 : row.pagerank),
+        colorscale: community ? [[0, group.color], [1, group.color]] : [[0, "#edf3ff"], [1, blue]],
+        showscale: !community, colorbar: { title: { text: "PageRank" }, thickness: 12, len: .7 },
+        marker: { opacity: .85, line: { width: .5, color: "white" } } };
+      return { ...trace, type: "scattermap", mode: "markers",
+        lon: values.map((row) => anchors.get(Number(row.zone_id)).longitude),
+        lat: values.map((row) => anchors.get(Number(row.zone_id)).latitude),
+        marker: { size: 10, color: community ? group.color : values.map((row) => row.pagerank),
+          colorscale: [[0, "#a7c2f4"], [1, blue]], showscale: !community } };
+    });
+    byId("graph-legend").innerHTML = community ? [...palette].map(([label, color]) =>
+      `<span><i style="background:${escapeHtml(color)}"></i>Group ${label + 1}</span>`).join("") +
+      (rows.some((row) => row.is_isolated) ? `<span><i style="background:#8793a4"></i>Isolated zones</span>` : "") :
+      "Darker blue means a larger weighted PageRank score.";
+    plot("graph-map", traces, { height: 470,
+      map: { style: "white-bg", center: { lat: 40.74, lon: -73.96 }, zoom: 9.5 },
+      margin: { l: 0, r: 0, t: 0, b: 0 }, uirevision: `${state.summary.meta.snapshot_id}-graph` });
+  }
+  byId("graph-view").onchange = drawGraph;
+  drawGraph();
+}
+
 async function zones(request) {
-  const data = await load("od.json");
+  const [data, graphData] = await Promise.all([load("od.json"), load("graph.json", true)]);
   if (request !== state.request) return;
   const pairCap = state.summary.meta.max_flows || 200;
   const pairLimits = [25, 50, 100, 200].filter((limit) => limit <= pairCap);
@@ -697,7 +839,7 @@ async function zones(request) {
       "Origin–destination table",
       `<div id="od-table"></div>`,
       "Trip counts retain records with valid endpoints even when duration is unavailable. Mean duration uses only eligible duration records.",
-    );
+    ) + `<div id="graph-section"></div>`;
   let drawRequest = 0;
   async function draw() {
     const localRequest = ++drawRequest;
@@ -805,197 +947,197 @@ async function zones(request) {
   byId("od-destination").onchange = draw;
   byId("od-limit").onchange = draw;
   await draw();
+  if (request === state.request) await renderGraph(graphData, request);
 }
 
 async function anomalies(request) {
-  const data = await load("anomalies.json");
+  const [volumeData, durationData] = await Promise.all([
+    load("anomalies.json"), load("duration-anomalies.json", true),
+  ]);
   if (request !== state.request) return;
-  const anomalyModel = state.summary.meta.models?.anomalies || {};
-  const parameters = anomalyModel.anomalies_config || state.summary.meta.anomaly_parameters || anomalyModel.parameters || {};
-  const scoreThreshold = anomalyModel.threshold ?? data.alerts[0]?.threshold ?? parameters.score_threshold ?? 4;
-  const countThreshold = parameters.absolute_threshold ?? data.alerts[0]?.absolute_threshold ?? 20;
-  const scaleFloor = parameters.scale_floor ?? 5;
-  const minHistory = parameters.min_history ?? 8;
-  const splits = modelSplits();
-  const splitLabel = (split) => ({ calibration: "Calibration", test: "Test", train: "Training" })[split] || split;
+  const hasDuration = Boolean(state.summary.meta.models?.duration_anomalies || durationData?.status_counts?.length);
   byId("view-controls").innerHTML =
-    `<div class="wide-control"><label for="alert-zone">Zone · exported alerts only</label><select id="alert-zone">${zoneOptions()}</select></div>`;
-  byId("page-content").innerHTML =
-    notice(
-      "Alerts are statistical deviations, not verified incidents, fraud, congestion, or causal explanations. Synthetic evaluation is not real-world detection accuracy.",
-    ) +
-    notice(
-      `This public snapshot exports the ${number(data.alert_limit)} largest alert hours and at most ${number(data.incident_limit)} merged incidents from the full period. Zone filtering selects within that bounded export; it does not rerank all underlying records.`,
-    ) +
-    panel(
-      "How to read an alert",
-      `<p><strong>Training (${escapeHtml(periodLabel(splits, "train"))})</strong> establishes the historical baseline. <strong>Calibration (${escapeHtml(periodLabel(splits, "calibration"))})</strong> is the separate period used to check detector choices. <strong>Test (${escapeHtml(periodLabel(splits, "test"))})</strong> evaluates the frozen detector on later data. A test alert is not automatically a verified event.</p><p><strong>Observed</strong> is the number of recorded pickups in one zone during one hour. <strong>Baseline</strong> is that zone’s median pickup count for the same weekday and hour in the training period. <strong>History</strong> counts the matching training observations used, not the number of past alerts.</p><p><code>score = (observed − baseline) / max(1.4826 × MAD, ${number(scaleFloor)})</code></p><p>MAD is the median absolute deviation of those historical counts from their median. The minimum scale of ${number(scaleFloor)} prevents small baselines from producing unstable scores. A positive score means more pickups than usual; a negative score means fewer. An alert requires both <strong>|score| ≥ ${number(scoreThreshold)}</strong> and an absolute difference of at least <strong>${number(countThreshold)} pickups</strong>, with at least <strong>${number(minHistory)} matching historical observations</strong>. The score is not a percentage, probability, or explanation of the cause.</p>`,
-    ) +
-    panel(
-      "Scoring coverage",
-      table(
-        data.status_counts,
-        [
-          ["status", "Status"],
-          ["zone_hours", "Zone-hours"],
-        ],
-        20,
-      ),
-      `Total threshold alert hours in the source result: ${number(data.total_alert_hours)}. Total merged incidents: ${number(data.total_incidents)}.`,
-    ) +
-    panel(
-      "Observed versus expected",
-      `<label for="alert-choice">Inspect an exported alert</label><select id="alert-choice"></select>${chartDiv("alert-context")}`,
-      "Observed pickups and the seasonal median, up to 48 hours on either side. The score is not a probability or a p-value.",
-    ) +
-    panel("Largest exported alert hours", `<div id="alert-table"></div>`) +
-    panel(
-      "Merged incidents",
-      `<div id="incident-table"></div>`,
-      "Adjacent alert hours are grouped into candidate incidents using the saved detector policy. Unreviewed means no independent evidence has confirmed or explained the event; it is the display name for the saved ‘unresolved’ label.",
-    );
-  function drawContext() {
-    const id = byId("alert-choice").value,
-      context = data.contexts[id];
-    if (!context?.length) {
-      emptyPlot(
-        "alert-context",
-        "No exported alert context. Insufficient history is not evidence of normal activity.",
-      );
+    `<div class="compact-control"><label for="alert-metric">Metric</label><select id="alert-metric"><option value="volume">Pickup volume</option><option value="duration"${hasDuration ? "" : " disabled"}>Travel duration${hasDuration ? "" : " · not published"}</option></select></div><div class="wide-control"><label for="alert-zone">Zone · exported alerts only</label><select id="alert-zone">${zoneOptions()}</select></div>`;
+  const splitLabel = (split) => ({ calibration: "Calibration", test: "Test", train: "Training" })[split] || split;
+  function renderMetric() {
+    const metric = byId("alert-metric").value;
+    const data = metric === "duration" ? durationData : volumeData;
+    if (!data) {
+      byId("page-content").innerHTML = notice("This metric has not been published for this snapshot.");
       return;
     }
-    plot(
-      "alert-context",
-      [
-        {
-          type: "scatter",
-          mode: "lines",
-          x: context.map((row) => row.hour),
-          y: context.map((row) => row.observed),
-          name: "Observed pickups",
-          line: { color: blue, width: 2.5 },
-          connectgaps: false,
-        },
-        {
-          type: "scatter",
-          mode: "lines",
-          x: context.map((row) => row.hour),
-          y: context.map((row) => row.baseline),
-          name: "Seasonal median",
-          line: { color: teal, width: 2, dash: "dash" },
-          connectgaps: false,
-        },
-        {
-          type: "scatter",
-          mode: "markers",
-          x: context.filter((row) => row.is_alert).map((row) => row.hour),
-          y: context.filter((row) => row.is_alert).map((row) => row.observed),
-          name: "Statistical alert",
-          marker: { symbol: "diamond", size: 8, color: "#b91c1c" },
-        },
-      ],
-      {
-        hovermode: "x unified",
-        xaxis: { title: { text: "NYC source local time" } },
-        yaxis: { title: { text: "Recorded pickups" }, rangemode: "tozero" },
-      },
-    );
+    const definition = alertDefinition(metric, state.summary.meta, data);
+    const { duration, unit, splits, scoreThreshold, absoluteThreshold, scaleFloor, minHistory, minTrips } = definition;
+    const observedMeaning = duration ?
+      "the mean eligible-trip duration, in minutes, for trips starting in one pickup zone during one hour" :
+      "the number of recorded pickups in one zone during one hour";
+    const baselineMeaning = duration ?
+      "that zone's median of sufficiently populated hourly mean durations at the same weekday and hour during training. Each supported historical hour has equal weight" :
+      "that zone's median pickup count at the same weekday and hour during training";
+    const supportNote = duration ?
+      `<p>Both training and scored hours need at least <strong>${number(minTrips)} eligible trips</strong>. Hours with fewer trips, missing coverage or insufficient history are gaps, not zero-minute trips. The eligible trip filters are the fixed study limits recorded in the model.</p><p>Longer mean duration can reflect a change in destinations or trip lengths. This detector does not adjust for that trip mix, so it does not establish congestion, slower traffic or passenger delay.</p>` :
+      "<p>Pickup volume measures completed recorded trips. It does not measure people unable to find a taxi or all travel demand.</p>";
+    byId("page-content").innerHTML =
+      notice("Alerts are statistical deviations, not verified incidents, fraud, congestion or causal explanations. Unreviewed means a person has not yet checked the explanation.") +
+      notice(`This metric exports the ${number(data.alert_limit)} largest alert hours and at most ${number(data.incident_limit)} merged incidents. Zone filtering selects within that bounded export; it does not rerank every source hour.`) +
+      panel("How to read an alert",
+        `<p><strong>Training (${escapeHtml(periodLabel(splits, "train"))})</strong> establishes the baseline. <strong>Calibration (${escapeHtml(periodLabel(splits, "calibration"))})</strong> selects the threshold under an alert-volume budget. <strong>Test (${escapeHtml(periodLabel(splits, "test"))})</strong> uses the frozen detector on later hours. That alert budget is not a false-positive probability.</p><p><strong>Observed</strong> is ${observedMeaning}. <strong>Baseline</strong> is ${baselineMeaning}. <strong>History</strong> counts matching observed training hours, not trips or previous alerts.</p><p><code>score = (observed − baseline) / max(1.4826 × MAD, ${number(scaleFloor)})</code></p><p>MAD is the median absolute difference of historical ${duration ? "hourly means" : "counts"} from their median. The scale floor is <strong>${number(scaleFloor)} ${unit}</strong>. Positive means ${duration ? "longer duration" : "more pickups"}; negative means ${duration ? "shorter duration" : "fewer pickups"}. An alert needs <strong>|score| ≥ ${number(scoreThreshold)}</strong>, a change of at least <strong>${number(absoluteThreshold)} ${unit}</strong>, and at least <strong>${number(minHistory)} matching historical hours</strong>. The score is not a percentage, probability or cause.</p>${supportNote}`) +
+      panel("Scoring coverage", table(data.status_counts, [["status", "Status"], ["zone_hours", "Zone-hours"]], 20),
+        `Threshold alert hours: ${number(data.total_alert_hours)}. Merged incidents: ${number(data.total_incidents)}. Missing or unsupported hours are not evidence of normal activity.`) +
+      panel("Observed versus expected", `<label for="alert-choice">Inspect an exported alert</label><select id="alert-choice"></select>${chartDiv("alert-context")}`,
+        `${duration ? "Mean eligible-trip duration in minutes" : "Recorded pickup count"} and the historical median, up to 48 hours on either side. Missing and unsupported observations remain gaps.`) +
+      panel("Largest exported alert hours", `<div id="alert-table"></div>`) +
+      panel("Merged incidents", `<div id="incident-table"></div>`,
+        "Adjacent alert hours are grouped using the saved detector policy. Unreviewed is the display name for the saved unresolved label; computation has finished, but no real-world event has been confirmed.");
+    function drawContext() {
+      const context = data.contexts[byId("alert-choice").value];
+      if (!context?.length) {
+        emptyPlot("alert-context", "No exported alert context for this selection.");
+        return;
+      }
+      plot("alert-context", [
+        { type: "scatter", mode: "lines", x: context.map((row) => row.hour), y: context.map((row) => row.observed),
+          name: definition.observedLabel, line: { color: blue, width: 2.5 }, connectgaps: false },
+        { type: "scatter", mode: "lines", x: context.map((row) => row.hour), y: context.map((row) => row.baseline),
+          name: "Historical median", line: { color: teal, width: 2, dash: "dash" }, connectgaps: false },
+        { type: "scatter", mode: "markers", x: context.filter((row) => row.is_alert).map((row) => row.hour),
+          y: context.filter((row) => row.is_alert).map((row) => row.observed), name: "Statistical alert",
+          marker: { symbol: "diamond", size: 8, color: "#b91c1c" } },
+      ], { hovermode: "x unified", xaxis: { title: { text: "NYC source local time" } },
+        yaxis: { title: { text: duration ? "Mean trip duration (minutes)" : "Recorded pickups" }, rangemode: "tozero" } });
+    }
+    function draw() {
+      const zone = byId("alert-zone").value;
+      const alerts = data.alerts.filter((row) => zone === "all" || Number(row.zone_id) === Number(zone));
+      byId("alert-choice").innerHTML = alerts.length ? alerts.map((row) =>
+        `<option value="${escapeHtml(row.context_id)}">${escapeHtml(zoneName(row.zone_id))} · ${escapeHtml(row.hour.slice(0, 16).replace("T", " "))} · score ${number(row.score, 2)} · ${escapeHtml(splitLabel(row.split))}</option>`).join("") :
+        `<option value="">No exported alerts in this selection</option>`;
+      byId("alert-choice").disabled = !alerts.length;
+      byId("alert-table").innerHTML = table(alerts.map((row) => ({ ...row, zone: zoneName(row.zone_id), split: splitLabel(row.split) })), [
+        ["zone", "Zone"], ["hour", "Local hour"], ["split", "Split"],
+        ["observed", definition.observedLabel], ["baseline", definition.baselineLabel],
+        ...(duration ? [["eligible_trip_count", "Eligible trips in hour"]] : []),
+        ["score", "Score"], ["threshold", "Threshold"], ["history_count", "Matching historical hours"],
+      ], data.alert_limit);
+      const incidents = data.incidents.filter((row) => zone === "all" || Number(row.zone_id) === Number(zone)).map((row) =>
+        ({ ...row, zone: zoneName(row.zone_id), label: row.label === "unresolved" ? "Unreviewed" : row.label }));
+      byId("incident-table").innerHTML = table(incidents, [
+        ["zone", "Zone"], ["start_hour", "Start"], ["end_hour", "End"], ["direction", "Direction"],
+        ["affected_hours", "Hours"], ["peak_score", "Peak score"], ["label", "Review label"],
+      ], data.incident_limit);
+      drawContext();
+    }
+    byId("alert-zone").onchange = draw;
+    byId("alert-choice").onchange = drawContext;
+    draw();
   }
-  function draw() {
-    const zone = byId("alert-zone").value,
-      alerts = data.alerts.filter(
-        (row) => zone === "all" || Number(row.zone_id) === Number(zone),
-      );
-    byId("alert-choice").innerHTML = alerts.length
-      ? alerts
-          .map(
-            (row) =>
-              `<option value="${row.context_id}">${escapeHtml(zoneName(row.zone_id))} · ${escapeHtml(row.hour.slice(0, 16).replace("T", " "))} · score ${number(row.score, 2)} · ${escapeHtml(splitLabel(row.split))}</option>`,
-          )
-          .join("")
-      : `<option value="">No exported alerts in this selection</option>`;
-    byId("alert-choice").disabled = !alerts.length;
-    byId("alert-table").innerHTML = table(
-      alerts.map((row) => ({ ...row, zone: zoneName(row.zone_id), split: splitLabel(row.split) })),
-      [
-        ["zone", "Zone"],
-        ["hour", "Local hour"],
-        ["split", "Split"],
-        ["observed", "Observed pickups"],
-        ["baseline", "Baseline pickups"],
-        ["score", "Score"],
-        ["threshold", "Threshold"],
-        ["history_count", "Matching historical hours"],
-      ],
-      data.alert_limit,
-    );
-    const incidents = data.incidents
-      .filter((row) => zone === "all" || Number(row.zone_id) === Number(zone))
-      .map((row) => ({ ...row, zone: zoneName(row.zone_id), label: row.label === "unresolved" ? "Unreviewed" : row.label }));
-    byId("incident-table").innerHTML = table(
-      incidents,
-      [
-        ["zone", "Zone"],
-        ["start_hour", "Start"],
-        ["end_hour", "End"],
-        ["direction", "Direction"],
-        ["affected_hours", "Hours"],
-        ["peak_score", "Peak score"],
-        ["label", "Review label"],
-      ],
-      data.incident_limit,
-    );
-    drawContext();
+  byId("alert-metric").onchange = renderMetric;
+  renderMetric();
+}
+
+function renderPipelinePerformance(data) {
+  const target = byId("pipeline-section");
+  if (!target) return;
+  if (!data?.trials?.length) {
+    target.innerHTML = panel("Full pipeline scaling", notice("No complete-pipeline CPU/GPU experiment has been published in this snapshot. The stage measurements below cover narrower work."));
+    return;
   }
-  byId("alert-zone").onchange = draw;
-  byId("alert-choice").onchange = drawContext;
-  draw();
+  const rows = validatedMeasured(data.trials), points = pipelineMedians(data.trials);
+  const measured = data.trials.filter((row) => row.phase === "measured");
+  const warmups = data.trials.filter((row) => row.phase === "warmup");
+  const comparisons = data.comparisons || [];
+  const monthByRows = new Map(measured.map((row) => [Number(row.input_rows), row.months ?? row.month_count]));
+  target.innerHTML =
+    panel("Full pipeline scaling",
+      notice(`${number(rows.length)} validated measured runs; ${number(warmups.length)} warmups and ${number(measured.length - rows.length)} unvalidated measured runs excluded from the timing chart. Stage timing/backend selectors do not change these full-pipeline panels.`) + chartDiv("pipeline-chart"),
+      "Starts with local raw TLC files and runs checks, cleaning, features, aggregations, clustering, both anomaly detectors, graph analysis and artifact writes. Built-in checks are included, including the GPU graph's CPU reference calculation. Downloads, separate benchmark validation and website publication are excluded. Six months adds calibration/test work absent from one/three-month runs, so scaling reflects more records and more analysis. Points are measured medians; whiskers show the observed minimum and maximum.") +
+    panel("Matched full pipeline CPU/GPU comparisons", comparisons.length ? table(comparisons.map((row) => ({
+      ...comparisonDisplay(row), months: monthByRows.get(Number(row.input_rows)),
+      protocol: row.protocol_hash ? String(row.protocol_hash).slice(0, 12) : "Not recorded",
+    })), [
+      ["months", "Months"], ["input_rows", "Raw rows"], ["cpu_seconds", "CPU seconds"],
+      ["gpu_seconds", "GPU seconds"], ["time_ratio", "CPU time / GPU time"], ["faster", "Faster backend"],
+      ["experiment_id", "Experiment"], ["protocol", "Protocol ID"],
+    ]) : notice("No CPU/GPU pair has passed matching-workload validation for this experiment yet."),
+      "Each ratio pairs the same experiment, input rows, stage, timing scope and protocol. Warmups are excluded. A ratio below one means the CPU finished faster. These pipeline comparisons are separate from the older stage experiments below.") +
+    panel("Full pipeline sampled resources", table(measured.map(pipelineResourceRow), [
+      ["months", "Months"], ["backend", "Backend"], ["repeat", "Repeat"], ["input_rows", "Raw rows"],
+      ["elapsed_s", "Seconds"], ["host_gib", "Sampled host peak (GiB)"], ["gpu_gib", "Sampled GPU peak (GiB)"],
+      ["rss_interval_ms", "Requested host interval (ms)"], ["gpu_interval_ms", "Requested GPU interval (ms)"],
+      ["rss_samples", "Host samples"], ["gpu_samples", "GPU samples"], ["background", "Other GPU activity"],
+      ["validation", "Validation"],
+    ], 200),
+      "These are the largest observed samples, not guaranteed peak memory. Host RSS covers the monitored process tree; GPU memory is sampled for the trial's processes. Short spikes, missing process readings and incomplete sampling can understate usage. Unavailable is not zero. Other GPU activity can affect timings. GiB means bytes divided by 1,073,741,824.") +
+    panel("Full pipeline experiment conditions", environmentDetails(data.environment), "These conditions belong to the pipeline experiment. Stage experiments below retain their own environment and configuration.") +
+    `<p class="muted artifact-links"><a href="data/pipeline-performance.json">Download full pipeline trials and matching comparisons</a></p>`;
+  if (!points.length) {
+    emptyPlot("pipeline-chart", "No validated measured full-pipeline timings are available.");
+    return;
+  }
+  const series = new Map();
+  for (const point of points) {
+    const key = JSON.stringify([point.experiment_id, point.backend, point.stage, point.timing_scope]);
+    if (!series.has(key)) series.set(key, []);
+    series.get(key).push(point);
+  }
+  const multipleExperiments = new Set(points.map((point) => point.experiment_id)).size > 1;
+  const traces = [...series.values()].map((values) => {
+    values.sort((a, b) => a.input_rows - b.input_rows);
+    const duplicateSizes = new Set(values.map((row) => row.input_rows)).size !== values.length;
+    return { type: "scatter", mode: duplicateSizes ? "markers" : "lines+markers",
+      x: values.map((row) => row.input_rows), y: values.map((row) => row.elapsed_s),
+      name: `${backendLabel(values[0].backend)}${multipleExperiments ? ` · ${values[0].experiment_id}` : ""}`,
+      customdata: values.map((row) => [row.months ?? row.month_count, row.repetitions, row.minimum_s, row.maximum_s, row.protocol_hash]),
+      marker: { size: 9, color: values[0].backend === "cpu" ? blue : teal },
+      line: { color: values[0].backend === "cpu" ? blue : teal, width: 2 },
+      error_y: { type: "data", symmetric: false,
+        array: values.map((row) => row.maximum_s - row.elapsed_s),
+        arrayminus: values.map((row) => row.elapsed_s - row.minimum_s) },
+      hovertemplate: "%{x:,} raw rows · %{customdata[0]} months<br>Median %{y:.3f} s · %{customdata[1]} measured runs<br>Observed range %{customdata[2]:.3f}–%{customdata[3]:.3f} s<extra>%{fullData.name}</extra>" };
+  });
+  plot("pipeline-chart", traces, { height: 400,
+    xaxis: { title: { text: "Raw source records processed" }, tickformat: ".2s", rangemode: "tozero" },
+    yaxis: { title: { text: "Full pipeline elapsed seconds" }, rangemode: "tozero" } });
 }
 
 async function renderPerformance(request) {
-  const data = await load("performance.json");
+  const [data, pipelineData] = await Promise.all([load("performance.json"), load("pipeline-performance.json", true)]);
   if (request !== state.request) return;
   if (!data.trials.length) {
     byId("view-controls").innerHTML = "";
     byId("page-content").innerHTML =
-      notice(
-        "No benchmark measurements have been published. CPU/GPU comparisons will appear only after matching workloads pass correctness checks and complete timed runs.",
-      ) +
-      panel(
-        "What will be measured",
-        `<p>Loaded computation, custom CUDA kernel execution, and complete local-file-to-result processing are separate timing scopes.</p><p>Comparisons use matching rows, precision, features, and outputs on the same host. Repetitions, failures, software versions, and hardware conditions remain part of the result.</p><p>A CPU win is a valid result. No speedup is assumed.</p>`,
-      );
+      panel("Where the GPU was used", processingDescription(state.summary.meta)) +
+      `<div id="pipeline-section"></div>` +
+      panel("Stage measurements", notice("No separate stage benchmark measurements have been published."));
+    renderPipelinePerformance(pipelineData);
     return;
   }
   const scopes = [...new Set(data.trials.map((row) => row.timing_scope))],
     backends = [...new Set(data.trials.map((row) => row.backend))];
-  const processing = state.summary.meta.processing || {
-    aggregation_backend: "cpu", clustering_backend: "cpu", anomaly_backend: "cpu",
-  };
   byId("view-controls").innerHTML =
-    `<div class="compact-control"><label for="trial-scope">Timing scope</label><select id="trial-scope"><option value="all">All scopes</option>${scopes.map((scope) => `<option>${escapeHtml(scope)}</option>`).join("")}</select></div><div class="compact-control"><label for="trial-backend">Backend</label><select id="trial-backend"><option value="all">All backends</option>${backends.map((backend) => `<option>${escapeHtml(backend)}</option>`).join("")}</select></div>`;
+    `<div class="compact-control"><label for="trial-scope">Stage timing scope</label><select id="trial-scope"><option value="all">All scopes</option>${scopes.map((scope) => `<option>${escapeHtml(scope)}</option>`).join("")}</select></div><div class="compact-control"><label for="trial-backend">Stage backend</label><select id="trial-backend"><option value="all">All backends</option>${backends.map((backend) => `<option>${escapeHtml(backend)}</option>`).join("")}</select></div>`;
   byId("page-content").innerHTML =
     notice(
-      `Published trials: ${number(data.total_trials)}. This static export includes at most ${number(data.display_limit)} raw trials. Date and zone filters do not apply; compare matching experiment, input size, stage, and timing scope.`,
+      `Published stage trials: ${number(data.total_trials)}. Date and zone filters do not apply. Full pipeline experiments below have their own records and scope; compare matching experiment, input size and protocol.`,
     ) +
     panel(
       "Where the GPU was used",
-      `<p>Published snapshot backends: <strong>aggregations ${escapeHtml(processing.aggregation_backend.toUpperCase())}</strong>, <strong>clustering ${escapeHtml(processing.clustering_backend.toUpperCase())}</strong>, and <strong>pickup-volume anomalies ${escapeHtml(processing.anomaly_backend.toUpperCase())}</strong>. These are the six-month January–June results shown on this site.</p><p>A separate January run of about 2.96 million source records used the NVIDIA TITAN RTX server for CUDA trip-feature calculations, cuDF filtering and aggregations, and cuML clustering. That January clustering was exploratory: it had no April calibration data. The matched CPU/GPU timings below were measured on that server.</p><p>Source loading and schema/time validation still use CPU work. The seasonal pickup-volume anomaly detector runs on the CPU. The zone-connection map displays saved origin–destination counts; no cuGraph graph algorithm has been run. Opening this site displays saved results and does not start a GPU job.</p><p>Benchmarks retain the configurations used when they were measured. They have not been rerun with the revised cluster plausibility limits and do not measure a matched CPU/GPU run of the full six-month dataset.</p>`,
-    ) +
+      processingDescription(state.summary.meta),
+    ) + `<div id="pipeline-section"></div>` +
     panel(
-      "Measured elapsed time",
+      "Stage elapsed time",
       chartDiv("trial-chart"),
-      "Every point is a recorded correctness-validated trial. Different workloads and timing scopes should not be interpreted as a single speedup.",
+      "These historical stage experiments retain their original configurations. Every point is a recorded correctness-validated trial. A loaded kernel or aggregation timing is not a full-pipeline speedup.",
     ) +
     panel(
-      "Matched CPU/GPU comparisons",
+      "Matched stage CPU/GPU comparisons",
       `<div id="speedup-table"></div>`,
       "CPU time / GPU time is a ratio of median seconds across all validated trials. It is always positive: above 1 means the GPU was faster; below 1 means the CPU was faster; 1 means equal times. The faster-backend column expresses the advantage for the winner (for example, a ratio of 0.5 means CPU faster by 2×). Seconds have six decimal places; original measurements remain in data/performance.json.",
     ) +
-    panel("Raw trials", `<div id="trial-table"></div>`) +
+    panel("Raw stage trials", `<div id="trial-table"></div>`) +
     panel(
-      "Benchmark environment",
-      `<pre class="code-block">${escapeHtml(JSON.stringify(data.environment || {}, null, 2))}</pre>`,
+      "Stage benchmark environment",
+      environmentDetails(data.environment),
       "The hardware and software used for these measurements. An empty object means no benchmark environment record was published; the snapshot-build machine is not a substitute.",
     );
   function draw() {
@@ -1085,11 +1227,22 @@ async function renderPerformance(request) {
   byId("trial-scope").onchange = draw;
   byId("trial-backend").onchange = draw;
   draw();
+  renderPipelinePerformance(pipelineData);
 }
 
 async function methods(request) {
-  const data = await load("methods.json");
+  const [data, pipelineData, graphData] = await Promise.all([
+    load("methods.json"), load("pipeline-performance.json", true), load("graph.json", true),
+  ]);
   if (request !== state.request) return;
+  const meta = state.summary.meta;
+  const hasDuration = Boolean(meta.models?.duration_anomalies);
+  const hasGraph = Boolean(graphData?.nodes?.length);
+  const comparisons = pipelineData?.comparisons || [];
+  const maximumComparedRows = Math.max(0, ...comparisons.map((row) => Number(row.input_rows) || 0));
+  const pipelineScope = comparisons.length ?
+    `Published matching CPU/GPU pipeline comparisons reach ${number(maximumComparedRows)} raw records${meta.raw_rows && maximumComparedRows >= meta.raw_rows ? ", including the full published input size" : ""}. They measure local raw-file processing through models and artifact writes; source downloads and website publication are excluded. Resource figures are sampled observations, not exact hardware high-water marks.` :
+    "This snapshot has no published matching full-pipeline CPU/GPU comparisons. Its stage experiments cover narrower operations and cannot establish whole-system speedup.";
   byId("view-controls").innerHTML = "";
   byId("page-content").innerHTML =
     panel(
@@ -1101,8 +1254,9 @@ async function methods(request) {
       `<p>TLC data describes recorded taxi and ride-hailing activity, not all citywide travel demand. Zone connections do not reveal streets taken or intermediate passenger positions.</p><p>Pickups and drop-offs are independently timed. OD connections are anchored to pickup time. Missing coverage is not zero activity, and boundary drop-offs may have partial source coverage.</p><p>Timestamps use the declared New York source-local convention. Repeated and nonexistent daylight-saving hours cannot be treated as ordinary hourly observations.</p><p>KMeans labels describe groups in the selected feature space. Statistical alerts do not establish real-world incidents or causality. Synthetic tests measure response to constructed perturbations.</p><p>Map boundaries and source records: NYC Taxi and Limousine Commission. This project is not an official NYC service.</p>`,
     ) +
     panel(
-      "Implemented scope and remaining project work",
-      `<p>The system acquires TLC records, cleans and aggregates them, fits trip clusters, detects unusual pickup counts, and publishes maps, charts, data quality checks, and matched CPU/GPU timings. CUDA, cuDF, and cuML were exercised in a separate January GPU run; the six-month public results were built on the CPU.</p><p>The advanced cuGraph component is not implemented. Origin–destination lines are a visualization, not a graph algorithm. Anomalies currently cover pickup volume only; travel-duration anomalies and separate demand analysis remain to be built. Completed taxi trips are an indicator of recorded activity, not a direct measurement of unmet travel demand.</p><p>Performance experiments compare selected input sizes and operations. A matched CPU/GPU benchmark of all six months, broader scalability testing, and fuller resource measurements remain project work. The historical measurements are not evidence that every pipeline stage is GPU accelerated or faster.</p>${state.summary.meta.models?.clustering?.eligibility ? "<p>The revised clustering plausibility limits were chosen after inspecting full-period chart outliers, rather than optimized for a cluster-quality score. Revised May–June clustering results are a retrospective evaluation; an additional untouched period is needed for independent confirmation.</p>" : ""}`,
+      "Implemented scope and remaining limitations",
+      processingDescription(meta) +
+      `<p>The system acquires TLC records, prepares features, aggregates activity, groups trips and detects unusual pickup volume. ${hasDuration ? "The duration detector also compares hourly mean eligible-trip minutes with a frozen historical baseline. Changing destinations and trip lengths can affect that mean; duration alerts alone do not prove congestion." : "Travel-duration anomaly results have not been published in this snapshot."}</p><p>${hasGraph ? "Zone network analysis includes weighted directed PageRank and weighted undirected Louvain communities. The map separates this fixed-period graph analysis from filtered origin–destination lines. Community numbers are labels, not ranked quality." : "Graph algorithm results have not been published in this snapshot; the origin–destination lines alone do not establish graph analysis."}</p><p>${escapeHtml(pipelineScope)}</p><p>Completed taxi trips indicate recorded activity, not unmet travel demand. Alerts remain unreviewed until checked against independent evidence. The small zone graph need not run faster on a GPU, and individual stage wins do not guarantee a faster complete pipeline.</p>${meta.models?.clustering?.eligibility ? "<p>The fixed trip plausibility limits were chosen after inspecting full-period chart outliers. Revised May–June clustering and duration results are retrospective analyses; an additional untouched period is needed for independent confirmation.</p>" : ""}`,
     ) +
     panel(
       "Frozen source records",
@@ -1137,7 +1291,11 @@ async function methods(request) {
     ) +
     panel(
       "Model status",
-      `<pre class="code-block">${escapeHtml(JSON.stringify(data.models, null, 2))}</pre>`,
+      table(Object.entries(data.models || {}).map(([name, model]) => ({
+        model: name.replaceAll("_", " "), status: model.status,
+        backend: model.backend || model.computation_backend || "Not recorded", metric: model.metric || "See definition",
+      })), [["model", "Analysis"], ["status", "Status"], ["backend", "Backend"], ["metric", "Metric"]]) +
+      `<details class="technical-details"><summary>Model parameters and evaluation details</summary><pre class="code-block">${escapeHtml(JSON.stringify(data.models, null, 2))}</pre></details>`,
     ) +
     panel(
       "Validation and export",

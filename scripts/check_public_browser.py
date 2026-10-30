@@ -78,14 +78,40 @@ def main():
                 page.locator("#od-limit").select_option("25")
                 expect(page.locator("#od-summary")).to_contain_text("25")
                 chart_checks["od_limit_control"] = True
+                if page.locator("#graph-view").count():
+                    expect(page.locator("#graph-view")).to_have_value("community")
+                    expect(page.locator("#graph-section")).to_contain_text("263")
+                    page.locator("#graph-view").select_option("pagerank")
+                    page.wait_for_function(
+                        "document.getElementById('graph-map').data[0].colorbar?.title?.text === 'PageRank'"
+                    )
+                    page.locator("#graph-view").select_option("community")
+                    chart_checks["graph_community_and_pagerank"] = True
             elif name == "anomalies":
                 expect(page.locator("#page-content")).to_contain_text("Unreviewed")
                 expect(page.locator("#page-content")).to_contain_text("MAD")
+                duration_option = page.locator('#alert-metric option[value="duration"]')
+                if duration_option.count() and duration_option.is_enabled():
+                    page.locator("#alert-metric").select_option("duration")
+                    expect(page.locator("#page-content")).to_contain_text("20 eligible trips")
+                    expect(page.locator("#alert-table")).to_contain_text("Eligible trips in hour")
+                    page.wait_for_function(
+                        "document.getElementById('alert-context').layout.yaxis.title.text === 'Mean trip duration (minutes)'"
+                    )
+                    page.screenshot(path=str(output / "public-duration.png"), full_page=True)
+                    chart_checks["duration_metric_units_and_support"] = True
+                    page.locator("#alert-metric").select_option("volume")
             elif name == "performance":
                 expect(page.locator("#speedup-table")).to_contain_text("CPU faster")
                 expect(page.locator("#speedup-table")).to_contain_text("0.004186")
                 expect(page.locator("#speedup-table")).to_contain_text("0.004763")
                 chart_checks["cpu_winner_and_precision"] = True
+                if page.locator("#pipeline-chart").count():
+                    page.wait_for_function(
+                        "document.getElementById('pipeline-chart').data?.length > 0"
+                    )
+                    expect(page.locator("#page-content")).to_contain_text("Sampled host peak (GiB)")
+                    chart_checks["full_pipeline_scaling"] = True
             records.append({"page": name, "elapsed_s": round(time.perf_counter() - started, 3)})
             page.screenshot(path=str(output / f"public-{name}.png"), full_page=True)
         page.locator('button[data-page="overview"]').click()

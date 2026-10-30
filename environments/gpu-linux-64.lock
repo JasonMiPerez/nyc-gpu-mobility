@@ -358,3 +358,14 @@ https://conda.anaconda.org/conda-forge/noarch/tomli-2.5.0-pyh5ded981_0.conda#36d
 https://conda.anaconda.org/conda-forge/noarch/pytest-9.2.0-pyhc364b38_1.conda#f0cfded84ced11a9dfb3790c4c1c0b63
 https://conda.anaconda.org/conda-forge/noarch/shellingham-1.5.4-pyhd8ed1ab_2.conda#83ea3a2ddb7a75c1b09cea582aa4f106
 https://conda.anaconda.org/conda-forge/noarch/typer-0.27.3-pyh5ded981_0.conda#3251bd81ef66ec6432b3159944c70d57
+https://conda.anaconda.org/conda-forge/linux-64/aiohttp-3.14.5-py312h8b7ec3f_0.conda#e5e9629c0a1c75dc79ec1ac35b0560da
+https://conda.anaconda.org/conda-forge/linux-64/frozenlist-1.8.0-py312hd8b35f9_1.conda#74f6f936099812a232809e7f607a8af7
+https://conda.anaconda.org/conda-forge/linux-64/multidict-7.2.1-py312hfd18d64_0.conda#9811577aef8b6c9e9fffd8c551da2a02
+https://conda.anaconda.org/conda-forge/linux-64/propcache-0.5.4-py312hfd18d64_2.conda#30ef631f5a7e1840b51937fb502e89db
+https://conda.anaconda.org/conda-forge/linux-64/yarl-1.25.1-py312hfd18d64_0.conda#91bb35918653d559dbd514c9064e512b
+https://conda.anaconda.org/conda-forge/noarch/aiohappyeyeballs-2.7.1-pyhd8ed1ab_0.conda#e51e09bf3b91c62b7461a9f94e92c2c9
+https://conda.anaconda.org/conda-forge/noarch/aiosignal-1.4.0-pyhd8ed1ab_0.conda#421a865222cd0c9d83ff08bc78bf3a61
+https://conda.anaconda.org/conda-forge/noarch/attrs-26.1.0-pyhcf101f3_0.conda#c6b0543676ecb1fb2d7643941fe375f2
+https://conda.anaconda.org/rapidsai/linux-64/cugraph-25.10.01-cuda12_py312_251013_741f9105.conda#7822e32e1f3c4ae4cc21f6f3d029cc8a
+https://conda.anaconda.org/rapidsai/linux-64/libcugraph-25.10.01-cuda12_251013_741f9105.conda#49c2b0c6164d58cdef6a241a931860a5
+https://conda.anaconda.org/rapidsai/linux-64/pylibcugraph-25.10.01-cuda12_py312_251013_741f9105.conda#00386706d97e179d0d3d26b23f737781

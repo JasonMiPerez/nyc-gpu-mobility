@@ -30,6 +30,19 @@ anomalies:
   scale_floor: 5.0
   score_threshold: 4.0
   absolute_threshold: 20
+duration_anomalies:
+  enabled: true
+  min_history: 8
+  min_trips_per_hour: 20
+  scale_floor_minutes: 2
+  absolute_threshold_minutes: 5
+  score_threshold: 4
+graph:
+  enabled: true
+  min_trips_per_edge: 1
+  pagerank_alpha: 0.85
+  louvain_resolution: 1
+  seed: 42
 benchmark:
   warmups: 2
   repeats: 7

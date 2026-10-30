@@ -20,7 +20,10 @@ PAGES = {
     "overview": ("Overview", "A measured view of recorded movement."),
     "patterns": ("Mobility patterns", "Explore when trips happen and how they differ."),
     "zones": ("Zones & connections", "Follow recorded connections between taxi zones."),
-    "anomalies": ("Unusual activity", "Compare recorded pickups with their seasonal baseline."),
+    "anomalies": (
+        "Unusual activity",
+        "Compare pickup activity and trip duration with seasonal history.",
+    ),
     "performance": (
         "CPU & GPU performance",
         "Compare measured work, with its conditions attached.",
@@ -352,7 +355,7 @@ def patterns(repo: SnapshotRepository, filters: Filters, selected_cluster):
             graph(charts.sample_distance_histogram(samples))
             if not samples.empty
             else notice("No sampled trips match the current filters."),
-            "Fixed bins for the same selected sample, including points outside the scatter's typical window. The first bin includes zero; each following bin excludes its lower edge and includes its upper edge. The >50-mile bin contains every longer distance. Bar heights are sample counts, not density or full-dataset totals.",
+            "Fixed bins for the same selected sample, including points outside the scatter's typical window. Bins include their lower edge and exclude their upper edge, except that 20–50 also includes 50 miles. The >50-mile bin contains every longer distance. Bar heights are sample counts, not density or full-dataset totals.",
         ),
     ]
 
@@ -406,13 +409,320 @@ def zone_explorer(repo: SnapshotRepository, filters: Filters, destinations, metr
             ),
             "Mean duration uses only eligible duration records; trip counts also retain records without a usable duration.",
         ),
+        *_graph_panels(repo, tiles),
+    ]
+
+
+def _graph_panels(repo: SnapshotRepository, tiles=False):
+    if not repo.has("graph_nodes"):
+        return [
+            panel(
+                "Zone network analysis",
+                notice("PageRank and community results have not been published in this snapshot."),
+            )
+        ]
+    nodes = repo.read("graph_nodes")
+    if nodes.empty:
+        return [panel("Zone network analysis", notice("No graph nodes are available."))]
+    model = repo.manifest.get("models", {}).get("graph", {})
+    rank = nodes.sort_values("pagerank", ascending=False).copy() if "pagerank" in nodes else nodes
+    start, end = (
+        repo.manifest.get("study_start", "unrecorded"),
+        repo.manifest.get("study_end", "unrecorded"),
+    )
+    threshold = model.get("parameters", {}).get("min_trips_per_edge")
+    backend = model.get("backend", "not recorded")
+    return [
+        panel(
+            "Zone network analysis",
+            html.Div(
+                [
+                    notice(
+                        f"Fixed graph for {str(start)[:10]} through {str(end)[:10]} (end exclusive). "
+                        "Date, origin, destination and endpoint-metric controls do not recompute "
+                        f"these graph results. Recorded graph backend: {backend}."
+                    ),
+                    html.P(
+                        model.get(
+                            "graph_definition",
+                            "Zones are connected by recorded origin–destination trips.",
+                        )
+                    ),
+                    html.P(
+                        model.get(
+                            "pagerank_meaning",
+                            "PageRank measures weighted directed connectivity, not passenger counts.",
+                        )
+                    ),
+                    html.P(
+                        model.get(
+                            "community_meaning",
+                            "Louvain community IDs are arbitrary labels, not ranks.",
+                        )
+                    ),
+                    html.P(
+                        model.get(
+                            "degree_meaning",
+                            "Degree counts retained neighbors; trip strength sums their edge weights.",
+                        )
+                    ),
+                    html.P(
+                        model.get(
+                            "self_trip_policy",
+                            "See the saved model definition for treatment of within-zone trips.",
+                        )
+                    ),
+                    html.P(
+                        f"Minimum retained directed-edge weight: {threshold:,} trips."
+                        if threshold is not None
+                        else "No edge threshold was recorded."
+                    ),
+                ]
+            ),
+        ),
+        html.Div(
+            [
+                panel(
+                    "PageRank across zones",
+                    graph(
+                        charts.graph_zone_map(
+                            nodes, repo.zones(), repo.geojson(), "pagerank", repo.snapshot_id, tiles
+                        )
+                    ),
+                    "A continuous connectivity score; larger values do not imply more passengers or a better zone.",
+                ),
+                panel(
+                    "Louvain communities",
+                    graph(
+                        charts.graph_zone_map(
+                            nodes,
+                            repo.zones(),
+                            repo.geojson(),
+                            "community",
+                            repo.snapshot_id,
+                            tiles,
+                        )
+                    ),
+                    "Categorical colors identify groups. Community numbers have no ranking. Use group labels in the table when colors repeat.",
+                ),
+            ],
+            className="two-columns",
+        ),
+        panel(
+            "Zone connectivity ranking",
+            table(
+                rank,
+                [
+                    "zone",
+                    "borough",
+                    "zone_id",
+                    "pagerank",
+                    "community",
+                    "in_degree",
+                    "out_degree",
+                    "degree",
+                    "in_trip_strength",
+                    "out_trip_strength",
+                    "self_trip_count",
+                    "is_isolated",
+                ],
+                300,
+                precision=6,
+            ),
+            "Sorted by PageRank. Degree and trip strength use the retained network; within-zone trips are shown separately.",
+        ),
+    ]
+
+
+def _period_text(model: dict, config: dict, period: str) -> str:
+    bounds = model.get("splits", config.get("splits", {}))
+    start, end = bounds.get(f"{period}_start"), bounds.get(f"{period}_end")
+    return (
+        f"{str(start)[:10]} to {str(end)[:10]} (end exclusive)"
+        if start and end
+        else "dates not recorded"
+    )
+
+
+def _duration_panels(repo: SnapshotRepository, filters: Filters):
+    if not repo.has("duration_scores"):
+        return [
+            panel(
+                "Unusual trip durations",
+                notice("Duration anomaly results have not been published in this snapshot."),
+            )
+        ]
+    model = repo.manifest.get("models", {}).get("duration_anomalies", {})
+    config = repo.manifest.get("config", {})
+    params = model.get("duration_anomalies_config", config.get("duration_anomalies", {}))
+    values = {
+        name: params.get(name, "not recorded")
+        for name in [
+            "min_history",
+            "min_trips_per_hour",
+            "scale_floor_minutes",
+            "absolute_threshold_minutes",
+        ]
+    }
+    threshold = model.get("calibration", {}).get(
+        "selected_threshold", model.get("threshold", params.get("score_threshold", "not recorded"))
+    )
+    data = repo.read("duration_scores", filters)
+    explanation = panel(
+        "Unusual trip durations",
+        html.Div(
+            [
+                html.P(
+                    "This separate detector compares the mean duration of eligible trips "
+                    "starting in each zone and hour, measured in minutes. It does not count trips "
+                    "or estimate travel time along a fixed route."
+                ),
+                html.P(
+                    f"An hour needs at least {values['min_trips_per_hour']} eligible trips. "
+                    f"The baseline needs at least {values['min_history']} comparable training "
+                    "hours for the same pickup zone, weekday and hour. Baseline is the median "
+                    "of those hourly means; history counts hours, not trips."
+                ),
+                html.P(
+                    "Score = (observed mean minutes − baseline minutes) / "
+                    f"max(1.4826 × training MAD, {values['scale_floor_minutes']} minutes). "
+                    f"An alert needs an absolute score of at least {threshold} and an absolute "
+                    f"change of at least {values['absolute_threshold_minutes']} minutes. "
+                    "Positive scores mean longer trips; negative scores mean shorter trips."
+                ),
+                html.P(
+                    f"Training: {_period_text(model, config, 'train')}. "
+                    f"Calibration: {_period_text(model, config, 'calibration')}. "
+                    f"Test: {_period_text(model, config, 'test')}. Calibration selects the "
+                    "threshold; the test period uses it frozen. An alert budget is not an accuracy or false-positive rate."
+                ),
+                html.P(
+                    model.get(
+                        "limitations",
+                        "Route, distance and destination composition can change mean duration. These scores do not establish congestion or a cause.",
+                    )
+                ),
+                html.P(
+                    "Missing hours are not zero minutes. Low-trip and unsupported hours receive no score. Unreviewed means a person has not yet checked an alert's explanation."
+                ),
+                html.P(
+                    f"Recorded computation backend: {model.get('computation_backend', 'not recorded')}."
+                ),
+            ]
+        ),
+        "Date and origin-zone filters apply to the following duration scores and incidents.",
+    )
+    if data.empty:
+        return [
+            explanation,
+            notice("No duration calibration or test hours match the current filters."),
+        ]
+    alerts = data.loc[data["is_alert"].fillna(False)].copy()
+    alerts["absolute_score"] = alerts["score"].abs()
+    alerts = alerts.sort_values(["absolute_score", "hour"], ascending=[False, True])
+    choices = alerts if not alerts.empty else data.loc[data["status"].eq("scored")]
+    context = charts.empty("No supported duration hours are available in this selection.")
+    context_description = "Context is limited to this selection and 48 hours either side; missing hours break the line."
+    if not choices.empty:
+        chosen = choices.iloc[0]
+        context = charts.anomaly_context(
+            data, int(chosen["zone_id"]), str(chosen["hour"]), "mean_duration_minutes"
+        )
+        context_description = (
+            f"Zone {int(chosen['zone_id'])}, {chosen['hour']}: "
+            + (
+                "largest absolute-score duration alert. "
+                if not alerts.empty
+                else "first supported duration hour; no alerts match. "
+            )
+            + context_description
+        )
+    renamed = alerts.rename(
+        columns={
+            "observed": "observed_mean_minutes",
+            "baseline": "baseline_mean_minutes",
+            "deviation": "change_in_mean_minutes",
+            "absolute_threshold": "minimum_change_minutes",
+        }
+    )
+    incidents = (
+        repo.read("duration_incidents", filters)
+        if repo.has("duration_incidents")
+        else pd.DataFrame()
+    )
+    if not incidents.empty:
+        incidents = incidents.sort_values("peak_score", ascending=False).rename(
+            columns={
+                "total_deviation": "sum_of_hourly_mean_changes_minutes",
+                "label": "review_label",
+            }
+        )
+    return [
+        explanation,
+        panel(
+            "Duration scoring coverage",
+            table(
+                data["status"].value_counts().rename_axis("status").reset_index(name="zone_hours")
+            ),
+        ),
+        panel("Mean trip duration versus baseline", graph(context), context_description),
+        panel(
+            "Largest duration alerts",
+            table(
+                renamed,
+                [
+                    "zone_id",
+                    "hour",
+                    "split",
+                    "eligible_trip_count",
+                    "observed_mean_minutes",
+                    "baseline_mean_minutes",
+                    "change_in_mean_minutes",
+                    "score",
+                    "threshold",
+                    "minimum_change_minutes",
+                    "history_count",
+                ],
+                20,
+            ),
+            "Top 20 selected hours by absolute duration score. Observations, baselines and changes are in minutes.",
+        ),
+        panel(
+            "Duration incidents and review",
+            table(
+                incidents,
+                [
+                    "zone_id",
+                    "split",
+                    "start_hour",
+                    "end_hour",
+                    "affected_hours",
+                    "peak_score",
+                    "sum_of_hourly_mean_changes_minutes",
+                    "review_label",
+                ],
+                20,
+            ),
+            model.get(
+                "incident_total_deviation_meaning",
+                "Sum of hourly mean-minute deviations, not total passenger delay. Unreviewed alerts are not confirmed incidents.",
+            ),
+        ),
     ]
 
 
 def anomalies(repo: SnapshotRepository, filters: Filters):
+    pickup_panels = _pickup_anomalies(repo, filters)
+    return [
+        *(pickup_panels if isinstance(pickup_panels, list) else [pickup_panels]),
+        *_duration_panels(repo, filters),
+    ]
+
+
+def _pickup_anomalies(repo: SnapshotRepository, filters: Filters):
     if not repo.has("anomaly_scores"):
         return notice(
-            "Anomaly results have not been published. A seasonal baseline needs multiple months of observed history."
+            "Pickup-count anomaly results have not been published. A seasonal baseline needs multiple months of observed history."
         )
     data = repo.read("anomaly_scores", filters)
     if data.empty:
@@ -489,7 +799,7 @@ def anomalies(repo: SnapshotRepository, filters: Filters):
                                 "Unreviewed (stored as unresolved) means a person has not yet "
                                 "checked the alert's real-world explanation. The calculation "
                                 "has finished; an alert is not a confirmed incident. This "
-                                "detector monitors pickup counts, not unusual trip durations."
+                                "pickup-count detector is separate from the duration detector below."
                             ),
                         ]
                     ),
@@ -539,7 +849,197 @@ def anomalies(repo: SnapshotRepository, filters: Filters):
     ]
 
 
+def _pipeline_benchmark_panels(repo: SnapshotRepository):
+    if not repo.has("pipeline_benchmark_runs"):
+        return [
+            panel(
+                "Full raw-file pipeline benchmark",
+                notice("No full raw-file pipeline trials have been published in this snapshot."),
+            )
+        ]
+    data = repo.read("pipeline_benchmark_runs")
+    environment = repo.manifest.get("pipeline_benchmark_environment", {})
+    if data.empty:
+        return [
+            panel(
+                "Full raw-file pipeline benchmark",
+                notice("No completed pipeline trial rows are available."),
+            )
+        ]
+    valid = data.loc[
+        data["validation"].astype(str).str.lower().eq("passed")
+        & pd.to_numeric(data["elapsed_s"], errors="coerce").between(
+            0, float("inf"), inclusive="neither"
+        )
+    ].copy()
+    if "phase" in valid:
+        valid = valid.loc[valid["phase"].eq("measured")]
+    pair_keys = [
+        name
+        for name in [
+            "experiment_id",
+            "protocol_hash",
+            "stage",
+            "timing_scope",
+            "input_rows",
+            "months",
+        ]
+        if name in valid
+    ]
+    summary, comparisons = pd.DataFrame(), pd.DataFrame()
+    if not valid.empty and pair_keys:
+        grouped = valid.groupby(pair_keys + ["backend"], dropna=False)
+        summary = grouped.agg(
+            measured_trials=("elapsed_s", "size"),
+            median_seconds=("elapsed_s", "median"),
+            minimum_seconds=("elapsed_s", "min"),
+            maximum_seconds=("elapsed_s", "max"),
+        ).reset_index()
+        for column, label in [
+            ("peak_host_rss_sampled_bytes", "largest_sampled_host_RSS_GiB"),
+            ("peak_gpu_memory_sampled_bytes", "largest_sampled_GPU_memory_GiB"),
+        ]:
+            if column in valid:
+                memory = grouped[column].max().reset_index(name=label)
+                memory[label] = memory[label] / 1024**3
+                summary = summary.merge(memory, on=pair_keys + ["backend"], validate="one_to_one")
+        paired = (
+            valid.groupby(pair_keys + ["backend"], dropna=False)["elapsed_s"]
+            .median()
+            .unstack("backend")
+        )
+        if {"cpu", "gpu"}.issubset(paired.columns):
+            comparisons = (
+                paired[["cpu", "gpu"]]
+                .dropna()
+                .reset_index()
+                .rename(columns={"cpu": "cpu_seconds", "gpu": "gpu_seconds"})
+            )
+            comparisons["cpu_over_gpu_ratio"] = (
+                comparisons["cpu_seconds"] / comparisons["gpu_seconds"]
+            )
+            comparisons["result"] = comparisons["cpu_over_gpu_ratio"].map(
+                lambda value: (
+                    f"GPU {value:.3f}× faster"
+                    if value > 1
+                    else f"CPU {1 / value:.3f}× faster"
+                    if value < 1
+                    else "Equal median time"
+                )
+            )
+    if not summary.empty:
+        plotted = summary.copy()
+        plotted["workload"] = plotted["input_rows"].map(lambda rows: f"{int(rows):,} raw rows")
+        figure = charts.style(
+            px.bar(
+                plotted,
+                x="workload",
+                y="median_seconds",
+                color="backend",
+                barmode="group",
+                color_discrete_map=charts.BACKEND_COLORS,
+                labels={
+                    "median_seconds": "Median full-pipeline seconds",
+                    "workload": "Recorded source size",
+                },
+            )
+        )
+    else:
+        figure = charts.empty("No complete, correctness-validated measured pipeline trials.")
+    scope = environment.get(
+        "scope_notes",
+        "Raw-source checksums, file reads, normalization, features, aggregation, model fitting/evaluation/prediction, graph/duration analysis, artifact writes and built-in reconciliation. Network acquisition and publication are excluded.",
+    )
+    return [
+        panel(
+            "Full raw-file pipeline benchmark",
+            html.Div(
+                [
+                    notice(
+                        "This separate experiment retains its own full-pipeline scope and both backends. Date, zone and stage timing/backend controls do not filter these panels."
+                    ),
+                    html.P(scope),
+                    html.P(
+                        "Worker startup/imports, GPU preflight, cross-trial comparisons and final artifact hashing occur outside the timed interval. Lazy imports and initialization reached inside the pipeline remain timed. Built-in reconciliation and the graph's CPU reference also remain inside GPU trial times."
+                    ),
+                    html.P(
+                        "January and January–March have no April calibration or May–June test data. The six-month workload adds held-out evaluation as well as more records, so scaling across these prefixes does not isolate row-count growth. This full-pipeline scope is distinct from the stage benchmarks above."
+                    ),
+                    html.P(
+                        f"Recorded benchmark host: {environment.get('hostname', 'not recorded')}. CPU/GPU pairs must share the same experiment, input size and protocol. Only measured trials marked passed contribute; warmups, failed trials and incomplete pairs remain in the raw table."
+                    ),
+                    graph(figure),
+                ]
+            ),
+        ),
+        panel(
+            "Full-pipeline CPU/GPU comparison",
+            table(comparisons, precision=6)
+            if not comparisons.empty
+            else notice("No matched validated full-pipeline CPU/GPU pair is available."),
+            "Ratio = median CPU seconds / median GPU seconds. Above 1 favors GPU, below 1 favors CPU, and 1 is equal. A positive ratio alone does not mean the GPU won.",
+        ),
+        panel(
+            "Pipeline time and sampled memory",
+            table(
+                summary,
+                [
+                    "input_rows",
+                    "months",
+                    "backend",
+                    "measured_trials",
+                    "median_seconds",
+                    "minimum_seconds",
+                    "maximum_seconds",
+                    "largest_sampled_host_RSS_GiB",
+                    "largest_sampled_GPU_memory_GiB",
+                ],
+                precision=6,
+            ),
+            "Memory values are the largest sampled process-tree RSS and process GPU memory across measured trials, not exact peaks. Short spikes can be missed; process-tree RSS can count shared pages more than once. Missing GPU memory is unavailable, not zero. Sampling intervals and sample counts are recorded below.",
+        ),
+        panel(
+            "Full-pipeline raw trials",
+            table(
+                data,
+                [
+                    "trial_id",
+                    "backend",
+                    "phase",
+                    "months",
+                    "input_rows",
+                    "elapsed_s",
+                    "validation",
+                    "validation_elapsed_s",
+                    "rss_sample_interval_s",
+                    "gpu_sample_interval_s",
+                    "rss_samples",
+                    "gpu_samples",
+                    "background_gpu_processes",
+                    "selected_k",
+                    "cluster_eligible_rows",
+                    "error",
+                ],
+                250,
+                precision=6,
+            ),
+        ),
+        panel(
+            "Full-pipeline environment and protocol",
+            html.Pre(json.dumps(environment, indent=2, default=str), className="code-block"),
+        ),
+    ]
+
+
 def performance(repo: SnapshotRepository, timing_scope, backend):
+    stage_panels = _stage_performance(repo, timing_scope, backend)
+    return [
+        *(stage_panels if isinstance(stage_panels, list) else [stage_panels]),
+        *_pipeline_benchmark_panels(repo),
+    ]
+
+
+def _stage_performance(repo: SnapshotRepository, timing_scope, backend):
     data = repo.read("benchmark_runs")
     if data.empty:
         return notice(
@@ -691,6 +1191,8 @@ def methods(repo: SnapshotRepository):
         if c in source_rows
     ]
     cluster_model = repo.manifest.get("models", {}).get("clustering", {})
+    graph_model = repo.manifest.get("models", {}).get("graph", {})
+    duration_model = repo.manifest.get("models", {}).get("duration_anomalies", {})
     snapshot_backend = repo.manifest.get("backend", "not recorded")
     cluster_backend = cluster_model.get("backend", "not recorded")
     return [
@@ -711,13 +1213,13 @@ def methods(repo: SnapshotRepository):
                         "Times follow an explicit America/New_York source-local convention. Repeated or nonexistent daylight-saving hours cannot be treated as ordinary hourly observations. Missing source coverage remains distinct from a recorded zero."
                     ),
                     html.P(
-                        "KMeans groups similar feature values; cluster names are interpretations. Anomaly scores compare observed counts with a historical seasonal reference and are not calibrated probabilities."
+                        "KMeans groups similar feature values; cluster names are interpretations. Anomaly scores compare a recorded metric with its historical seasonal reference and are not calibrated probabilities."
                     ),
                 ]
             ),
         ),
         panel(
-            "Where the GPU is used and what remains",
+            "Executed analysis and its limits",
             html.Div(
                 [
                     html.P(
@@ -727,29 +1229,49 @@ def methods(repo: SnapshotRepository):
                         "Viewing charts does not start a GPU job."
                     ),
                     html.P(
-                        "The project's January 2024 validation processed 2,964,624 raw yellow-taxi "
-                        "records on the TITAN RTX: custom CUDA/CuPy numerical features, cuDF "
-                        "endpoint and origin–destination aggregations, and cuML KMeans. "
-                        "Source/schema normalization, timezone checks, quality masks, model "
-                        "scaling and anomaly scoring remain CPU work. The six-month published "
-                        "analysis was built on CPU; the January GPU validation is separate."
-                    )
-                    if repo.manifest.get("data_kind") == "real"
-                    else None,
-                    html.P(
-                        "The anomaly detector covers hourly pickup counts. It does not yet "
-                        "detect unusual trip durations or model unserved demand. The connections "
-                        "map summarizes zone pairs; cuGraph algorithms are not implemented."
+                        f"Graph analysis backend: {graph_model.get('backend', 'not recorded')}. "
+                        + (
+                            "This snapshot publishes weighted PageRank and Louvain communities. "
+                            + graph_model.get("preparation_backend", "")
+                            + ". "
+                            + graph_model.get(
+                                "limitations",
+                                "A taxi-zone graph is small; GPU acceleration is not assumed beneficial.",
+                            )
+                            if repo.has("graph_nodes")
+                            else "Graph algorithm results have not been published in this snapshot; OD lines alone are not a PageRank or community analysis."
+                        )
                     ),
                     html.P(
-                        "Performance measurements compare declared stages, mainly at 100,000 "
-                        "and 1,000,000 rows. The canonical-file aggregation benchmark includes "
-                        "reading, aggregation, necessary transfers and result writes, but excludes "
-                        "raw normalization, models and publication. It is not a timed comparison "
-                        "of the entire six-month system. Host memory is sampled every 10 ms; "
-                        "post-trial GPU pool observations are not a peak-VRAM measurement."
+                        (
+                            "Separate seasonal detectors cover pickup counts and hourly mean "
+                            "trip duration. Duration computation: "
+                            + duration_model.get("computation_backend", "not recorded")
+                            + ". "
+                            + duration_model.get(
+                                "limitations",
+                                "Route and distance composition can change mean duration; an alert does not establish congestion.",
+                            )
+                            if repo.has("duration_scores")
+                            else "The published seasonal detector covers pickup counts. Duration anomaly results have not been published in this snapshot."
+                        )
+                        + " Neither detector measures unserved travel demand."
+                    ),
+                    html.P(
+                        "Stage benchmarks describe their recorded operation and transfer scope. "
+                        + (
+                            "A separate full raw-file pipeline experiment is also published; it "
+                            "includes model analysis and artifact writes but excludes acquisition "
+                            "and publication. Its own trial rows record the measured source sizes. "
+                            "Process RSS and GPU memory are sampled observations, not exact peaks."
+                            if repo.has("pipeline_benchmark_runs")
+                            else "No full raw-file pipeline benchmark is published in this snapshot. "
+                            "A canonical-file aggregation benchmark excludes raw normalization "
+                            "and models, so its speedup cannot describe the whole system."
+                        )
                     ),
                     html.P(_cluster_inclusion(cluster_model)),
+                    html.P(repo.manifest.get("refit", {}).get("policy_revision_context", "")),
                 ]
             ),
         ),

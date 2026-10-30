@@ -51,6 +51,9 @@ CAPABILITIES = {
     "trip_plot_sample": ("pickup_local", "pickup_zone_id"),
     "anomaly_scores": ("hour", "zone_id"),
     "anomaly_incidents": ("start_hour", "zone_id"),
+    "duration_scores": ("hour", "zone_id"),
+    "duration_incidents": ("start_hour", "zone_id"),
+    "duration_hour": ("hour", "zone_id"),
     "trip_histogram": ("pickup_date", None),
 }
 
@@ -73,6 +76,15 @@ class SnapshotRepository:
             "zone_profile",
             "anomaly_baseline",
             "anomaly_evaluation",
+            "duration_scores",
+            "duration_incidents",
+            "duration_hour",
+            "duration_baseline",
+            "graph_nodes",
+            "graph_edges",
+            "graph_undirected_edges",
+            "pipeline_benchmark_runs",
+            "pipeline_benchmark_summary",
         }
     )
 
@@ -148,7 +160,7 @@ class SnapshotRepository:
         else:
             start = pa.scalar(pd.Timestamp(filters.start).to_pydatetime(), type=field_type)
             end = pa.scalar(pd.Timestamp(filters.end).to_pydatetime(), type=field_type)
-        if name == "anomaly_incidents" and "end_hour" in schema.names:
+        if name in {"anomaly_incidents", "duration_incidents"} and "end_hour" in schema.names:
             # Include events crossing the beginning of the selected interval.
             expression = (ds.field("end_hour") >= start) & (ds.field(time_column) < end)
         else:

@@ -1,11 +1,79 @@
-# First release: measured results
+# Release results and measurement history
 
 These observations were recorded on October 30, 2026. They are measured results,
 not proposed targets from the original specification.
 
-## Chart and clustering correction
+The latest complete experiment is summarized in
+[pipeline-scaling-results.md](pipeline-scaling-results.md). The expanded release
+appears first; subsequent sections preserve earlier measurement scopes.
 
-The current clustering run is `20261030T193520-94b28e21`, model
+## Expanded six-month GPU analysis
+
+Run `20261030T164900-a9f2d0b4` processes all **20,332,093** January–June 2024
+source records using the GPU pipeline. It retains the same verified totals:
+20,254,960 mapped pickups, 20,149,129 mapped drop-offs and 20,123,078
+pickup-anchored origin–destination trips.
+
+The cuML model `kmeans-f87033b3680d81ad` fits the deterministic 200,000-trip
+January–March training sample, selects **six clusters** using April, and predicts
+all **20,230,079** study-eligible trips. Its 2,000-trip May–June evaluation has
+silhouette **0.301884**. This is a retrospective chronological evaluation under
+the revised study bounds, not a new untouched-data validation. The two alternate
+initialization checks have adjusted Rand indices 0.838 and 0.458, so the groups
+should not be treated as uniquely determined passenger categories.
+
+The separate duration detector scores hourly mean eligible-trip minutes against
+the frozen zone/weekday/hour baseline. The selected threshold is four, with at
+least 20 trips per hour, eight historical hours and a five-minute absolute
+change. May–June contains **550 alert hours**, consolidated into **374 candidate
+incidents**. These are unreviewed statistical deviations, not confirmed congestion
+or measured passenger delay. An independent calculation from canonical timestamps
+reproduced the May 24, 11:00 JFK result exactly: 170 trips, mean 70.291176 minutes,
+baseline 40.821756 minutes, 13 historical hours and score 14.734710.
+
+Actual cuGraph PageRank and Louvain run on **263 mapped zones**, **43,501 directed
+cross-zone pairs** and 19,131,355 cross-zone trips. The 991,723 within-zone trips
+are counted separately. Three isolated zones remain included. This selected run
+has seven communities including their singleton labels, with weighted modularity
+0.199421. Every PageRank value passes the NetworkX comparison; the maximum
+absolute difference is **2.43 × 10⁻¹⁷**. Matching communities in this run do not
+imply that CPU and GPU Louvain partitions must always match.
+
+The full-pipeline experiment retains one warmup and three measured repetitions
+per backend at one, three and six months. Its fixed publication rule selects the
+first measured six-month GPU repetition, independently of runtime. See the
+[scaling report](pipeline-scaling-results.md) for the completed raw-trial summary,
+runtime comparisons and sampled resource measurements, and
+[extended methods](extended-methods.md) for the timing boundaries.
+
+All 18 measured trials passed. Six-month medians are **342.734 seconds CPU** and
+**334.459 seconds GPU**, a **1.025×** CPU/GPU ratio. This is a modest measured
+whole-pipeline advantage, not the much larger acceleration of some isolated
+stages. The three repetitions do not establish a universal or statistically
+significant winner. Maximum sampled six-month host RSS is 2.231 GiB for CPU runs
+and 3.009 GiB for GPU runs; GPU process memory reaches 7.891 GiB, including context
+and allocator reservations. Sampling reported no errors, but actual gaps reached
+about 32 ms for host memory and 45 ms for GPU monitoring. The server's desktop
+GPU services remained active.
+
+The original experiment, trial manifests, resource records, source checksums and
+exact code archive are retained under `artifacts/pipeline-scaling-20261030-complete/`.
+The SHA-256 of `computation-source.tar.gz` is
+`a91af44bfd79c75bc18a0dc13b0acf5468ae353c9423650fb71c338fed003fe3`.
+The later configuration fix propagates nondefault CPU thread counts into model
+fitting; the recorded experiment used four threads, matching its inner model
+limit, and was completed with its source frozen.
+
+Local verification: **159 passed, 7 GPU-only tests skipped**. Dedicated server
+validation: **36 passed**, including GPU contracts, duration checks and actual
+cuGraph agreement tests. The public browser check is recorded in
+`artifacts/qa/browser-public.json` against the selected published data.
+All five duration-result tables also match the independent local CPU reference
+(`artifacts/qa/final-gpu-data-check.json`).
+
+## Earlier chart and clustering correction
+
+The CPU clustering correction used run `20261030T193520-94b28e21`, model
 `kmeans-10a1a53e43121915`. A plotted source value of 100,125.14 miles in 13 minutes
 exposed an overly permissive clustering policy and an unreadable linear axis.
 Clustering now restricts reported distance to 100 miles, duration to 180 minutes
@@ -29,10 +97,10 @@ are present, including 75 reported zero distances. Sample distance bands include
 an overflow category. OD lines have top-N selection and scope explanations;
 anomaly definitions and CPU/GPU winner labels are explicit.
 
-Current verification: 105 CPU tests passed, six GPU-only tests skipped on the Mac.
+Verification for that correction: 105 CPU tests passed, six GPU-only tests skipped on the Mac.
 The original release measurements below remain a historical record; GPU trials
 were not rerun for this interface/model correction. See
-[proposal-coverage.md](proposal-coverage.md) for the remaining proposal gaps.
+[proposal-coverage.md](proposal-coverage.md) for current proposal coverage.
 
 ## Data and analysis
 
@@ -116,7 +184,7 @@ perturbations also reveal missed small/sparse changes under the absolute-count
 threshold. Three assistant-prepared case studies are available for review,
 but human review and causal corroboration have not been completed. Incident
 labels remain unresolved. Full-year scaling, feature/scale-floor ablations,
-ride-hailing, weather, graph algorithms, and distributed execution remain
+ride-hailing, weather, and distributed execution remain
 extensions rather than completed findings.
 
 The public site uses compact published data with an explicit filter-capability

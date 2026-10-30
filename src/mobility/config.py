@@ -29,10 +29,12 @@ class DataConfig(StrictModel):
 
 class ProcessingConfig(StrictModel):
     backend: Literal["cpu", "gpu"] = "cpu"
+    cpu_threads: int = Field(4, ge=1, strict=True)
     batch_rows: int = Field(250_000, ge=100, le=5_000_000)
     gpu_memory_fraction: float = Field(0.65, gt=0, lt=1)
     allow_missing_sources: bool = False
     custom_cuda: bool = False
+    verify_gpu_batches: bool = True
 
 
 class SplitConfig(StrictModel):
@@ -91,6 +93,31 @@ class BenchmarkConfig(StrictModel):
     seed: int = 42
 
 
+class DurationAnomalyConfig(StrictModel):
+    enabled: bool = True
+    min_history: int = Field(8, ge=3)
+    min_trips_per_hour: int = Field(20, ge=1)
+    scale_floor_minutes: float = Field(2.0, gt=0)
+    absolute_threshold_minutes: float = Field(5.0, gt=0)
+    score_threshold: float = Field(4.0, gt=0)
+    threshold_candidates: list[float] = Field(default_factory=lambda: [3, 4, 5, 6])
+    calibration_max_alert_fraction: float = Field(0.01, gt=0, lt=1)
+
+
+class GraphConfig(StrictModel):
+    enabled: bool = True
+    min_trips_per_edge: int = Field(1, ge=1)
+    pagerank_alpha: float = Field(0.85, gt=0, lt=1)
+    pagerank_tol: float = Field(1e-10, gt=0)
+    pagerank_max_iter: int = Field(1000, ge=1)
+    pagerank_atol: float = Field(1e-7, gt=0)
+    pagerank_rtol: float = Field(1e-5, gt=0)
+    louvain_resolution: float = Field(1.0, gt=0)
+    louvain_threshold: float = Field(1e-7, gt=0)
+    louvain_max_level: int = Field(100, ge=1)
+    seed: int = 42
+
+
 class DashboardConfig(StrictModel):
     max_flows: int = Field(200, ge=1, le=1000)
     max_points: int = Field(5000, ge=1, le=10_000)
@@ -105,6 +132,8 @@ class ProjectConfig(StrictModel):
     splits: SplitConfig = Field(default_factory=SplitConfig)
     clustering: ClusterConfig = Field(default_factory=ClusterConfig)
     anomalies: AnomalyConfig = Field(default_factory=AnomalyConfig)
+    duration_anomalies: DurationAnomalyConfig = Field(default_factory=DurationAnomalyConfig)
+    graph: GraphConfig = Field(default_factory=GraphConfig)
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
 
