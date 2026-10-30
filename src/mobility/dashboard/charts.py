@@ -180,7 +180,10 @@ def flows(data: pd.DataFrame, zones: pd.DataFrame, limit: int, tiles=False) -> g
         return empty("No mapped OD connections match these filters.")
     coordinates = zones.set_index("zone_id")[["longitude", "latitude"]].dropna()
     figure = go.Figure()
-    subset = data.head(limit)
+    subset = data.sort_values(
+        ["trip_count", "pickup_zone_id", "dropoff_zone_id"], ascending=[False, True, True]
+    ).head(limit)
+    names = zones.set_index("zone_id").zone.to_dict() if "zone" in zones else {}
     for row in subset.itertuples():
         if (
             row.pickup_zone_id not in coordinates.index
@@ -192,15 +195,22 @@ def flows(data: pd.DataFrame, zones: pd.DataFrame, limit: int, tiles=False) -> g
             coordinates.loc[row.dropoff_zone_id],
         )
         width = 0.8 + 3.5 * np.sqrt(row.trip_count / max(float(subset.trip_count.max()), 1))
+        description = (
+            f"{names.get(row.pickup_zone_id, row.pickup_zone_id)} → "
+            f"{names.get(row.dropoff_zone_id, row.dropoff_zone_id)}"
+            f"<br>{row.trip_count:,} recorded trips"
+        )
         figure.add_trace(
             go.Scattermap(
                 lon=[origin.longitude, destination.longitude],
                 lat=[origin.latitude, destination.latitude],
-                mode="lines",
+                mode="markers" if row.pickup_zone_id == row.dropoff_zone_id else "lines",
                 line=dict(width=width, color=BLUE),
+                marker=dict(size=10, color=BLUE),
                 opacity=0.45,
                 showlegend=False,
-                hoverinfo="skip",
+                text=[description, description],
+                hovertemplate="%{text}<extra></extra>",
             )
         )
     ids = sorted(
@@ -211,11 +221,11 @@ def flows(data: pd.DataFrame, zones: pd.DataFrame, limit: int, tiles=False) -> g
         go.Scattermap(
             lon=anchors.longitude,
             lat=anchors.latitude,
-            text=[str(i) for i in ids],
+            text=[f"{names.get(i, i)} (zone {i})" for i in ids],
             mode="markers",
             marker=dict(size=6, color=TEAL),
             name="Zone anchors",
-            hovertemplate="Zone %{text}<extra></extra>",
+            hovertemplate="%{text}<extra></extra>",
         )
     )
     figure.update_layout(
@@ -257,7 +267,97 @@ def scatter_sample(data: pd.DataFrame, maximum: int) -> go.Figure:
         hover_data=hover_columns,
         render_mode="webgl",
     )
-    return style(figure, height=400)
+    outside = int(
+        (~data.trip_distance_miles.between(0, 50) | ~data.duration_minutes.between(0, 120)).sum()
+    )
+    style(figure, height=470)
+    figure.update_layout(
+        xaxis=dict(range=[0, 50], autorange=False),
+        yaxis=dict(range=[0, 120], autorange=False),
+        margin=dict(t=110, b=75),
+        legend=dict(y=-0.23),
+        updatemenus=[
+            dict(
+                type="buttons",
+                direction="right",
+                x=0,
+                y=1.18,
+                buttons=[
+                    dict(
+                        label="Typical range",
+                        method="relayout",
+                        args=[
+                            {
+                                "xaxis.range": [0, 50],
+                                "xaxis.autorange": False,
+                                "yaxis.range": [0, 120],
+                                "yaxis.autorange": False,
+                            }
+                        ],
+                    ),
+                    dict(
+                        label="Full extent",
+                        method="relayout",
+                        args=[{"xaxis.autorange": True, "yaxis.autorange": True}],
+                    ),
+                ],
+            )
+        ],
+    )
+    figure.add_annotation(
+        text=(
+            f"Typical window: 0–50 miles, 0–120 minutes.<br>{outside:,} of {len(data):,} "
+            "sample points outside; Full extent shows all."
+        ),
+        x=0,
+        y=1.35,
+        xref="paper",
+        yref="paper",
+        xanchor="left",
+        yanchor="top",
+        showarrow=False,
+        font=dict(size=11),
+    )
+    return figure
+
+
+def sample_distance_histogram(data: pd.DataFrame) -> go.Figure:
+    """Keep a huge source value from stretching every ordinary sample bin."""
+    if data.empty:
+        return empty("No sampled trips match these filters.")
+    distance = pd.to_numeric(data.trip_distance_miles, errors="coerce")
+    valid = np.isfinite(distance) & distance.ge(0)
+    labels = ["0–<1", "1–<2", "2–<3", "3–<5", "5–<10", "10–<20", "20–50", ">50"]
+    # Match the public chart: left-inclusive bands, with 50 in the final finite band.
+    indices = np.searchsorted([1, 2, 3, 5, 10, 20, 50], distance[valid], side="right")
+    indices = np.where(distance[valid].eq(50), 6, indices)
+    counts = np.bincount(indices, minlength=len(labels))
+    figure = go.Figure(
+        go.Bar(
+            x=labels,
+            y=counts,
+            marker_color=BLUE,
+            hovertemplate="%{x} miles<br>%{y:,} sampled trips<extra></extra>",
+        )
+    )
+    figure.update_layout(xaxis_title="Trip distance (miles)", yaxis_title="Sampled trips")
+    style(figure, height=390)
+    figure.update_layout(margin=dict(t=70))
+    figure.add_annotation(
+        text=(
+            f"{int(valid.sum()):,} sample distances; {int((distance[valid] > 50).sum()):,} "
+            f"in >50-mile overflow.<br>{int((~valid).sum()):,} invalid values excluded."
+        ),
+        x=0,
+        y=1.20,
+        xref="paper",
+        yref="paper",
+        xanchor="left",
+        yanchor="top",
+        showarrow=False,
+        font=dict(size=11),
+    )
+    return figure
 
 
 def anomaly_context(data: pd.DataFrame, zone: int, selected_hour: str) -> go.Figure:

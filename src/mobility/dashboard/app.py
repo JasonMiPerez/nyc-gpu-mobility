@@ -58,7 +58,7 @@ def notice(message, kind="info"):
     return html.Div(message, className=f"notice {kind}", role="status")
 
 
-def table(frame: pd.DataFrame, columns=None, limit=100):
+def table(frame: pd.DataFrame, columns=None, limit=100, precision=3):
     if frame.empty:
         return notice("No rows are available for this view.")
     names = [name for name in (columns or frame.columns.tolist()) if name in frame]
@@ -70,7 +70,10 @@ def table(frame: pd.DataFrame, columns=None, limit=100):
         if value is None or pd.isna(value):
             return "—"
         if isinstance(value, float):
-            return f"{value:,.3f}".rstrip("0").rstrip(".")
+            formatted = f"{value:,.{precision}f}"
+            return formatted if precision != 3 else formatted.rstrip("0").rstrip(".")
+        if value == "unresolved":
+            return "Unreviewed"
         return str(value)
 
     return html.Div(
@@ -106,6 +109,28 @@ def table(frame: pd.DataFrame, columns=None, limit=100):
 
 def _number(value, precision=0):
     return "—" if pd.isna(value) else f"{value:,.{precision}f}"
+
+
+def _cluster_inclusion(model):
+    eligibility = model.get("eligibility", {})
+    thresholds = eligibility.get("thresholds", {})
+    names = ("max_distance_miles", "max_duration_minutes", "max_mean_speed_mph")
+    if not all(name in thresholds for name in names):
+        return (
+            "This older snapshot does not record the newer clustering inclusion limits. "
+            "Finite, nonnegative distance and positive duration alone can retain implausible trips."
+        )
+    distance, duration, speed = (thresholds[name] for name in names)
+    text = (
+        f"This clustering study includes trips of at most {distance:g} miles, "
+        f"{duration:g} minutes, and {speed:g} mph mean speed. These fixed study limits "
+        "restrict clustering and its sample plots; they do not remove valid endpoint counts "
+        "or change raw source files. Zero reported distances can still be included."
+    )
+    excluded = eligibility.get("excluded_from_canonical_eligible_rows")
+    if excluded is not None:
+        text += f" {excluded:,} otherwise eligible trips were excluded by these limits."
+    return text
 
 
 def _coverage(frame: pd.DataFrame):
@@ -170,6 +195,12 @@ def overview(repo: SnapshotRepository, filters: Filters, aggregation, tiles):
             ],
             className="kpi-grid",
         ),
+        notice(
+            "A pickup is one recorded trip beginning; a drop-off is one recorded trip ending. "
+            "Mapped totals count endpoints with a usable time and a recognized taxi zone "
+            "inside the applied selection. They count trips, not individual passengers. "
+            "The totals can differ because endpoint validity and selected dates or zones differ."
+        ),
         _coverage(data),
         panel(
             "Activity over time",
@@ -213,7 +244,8 @@ def patterns(repo: SnapshotRepository, filters: Filters, selected_cluster):
     if selected_cluster not in (None, "all") and "cluster" in samples:
         samples = samples[samples.cluster.astype(str).eq(str(selected_cluster))]
     samples = samples.head(repo.max_points)
-    model_status = repo.manifest.get("models", {}).get("clustering", {}).get("status", "")
+    model = repo.manifest.get("models", {}).get("clustering", {})
+    model_status = model.get("status", "")
     model_notice = (
         notice(
             "These clusters are exploratory: this snapshot has no separate calibration period. The selected cluster count has not been validated on a calibration period.",
@@ -287,31 +319,40 @@ def patterns(repo: SnapshotRepository, filters: Filters, selected_cluster):
         ),
         panel(
             "Trip groups",
-            summary_content,
+            html.Div(
+                [
+                    html.P(
+                        "KMeans groups trips using log(1 + distance), log(1 + duration), and "
+                        "pickup hour represented by sine and cosine so midnight stays close to "
+                        "11 p.m. Each feature is standardized using training data only. "
+                        "Zone IDs, fares and passenger identities are not clustering features."
+                    ),
+                    html.P(
+                        "The model learns from a fixed training sample; a separate calibration "
+                        "sample selects the number of clusters. Similar distances can belong to "
+                        "different groups because their duration or pickup time differs."
+                        if model_status != "exploratory_no_calibration"
+                        else "The model learns from a fixed training sample. This exploratory run "
+                        "does not have a separate calibration sample to select the cluster count."
+                    ),
+                    html.P(_cluster_inclusion(model)),
+                    summary_content,
+                ]
+            ),
             "Fixed model/scoring-period summary: date, zone, and selected-cluster controls do not change this table. Group numbers are labels, not ranked quality or known passenger types.",
         ),
         exact_distributions,
         panel(
             "Distance and duration",
             graph(charts.scatter_sample(samples, repo.max_points)),
-            f"Sampled trips only, at most {repo.max_points:,} points. The applied date, origin-zone, and cluster selections affect this plot; sample counts are not population totals.",
+            f"Sampled trips only, at most {repo.max_points:,} points. Typical range opens at 0–50 miles and 0–120 minutes; Full extent reveals all sampled points. The displayed outside-window count is not a data deletion. Date, origin-zone and cluster selections affect this plot; sample counts are not population totals.",
         ),
         panel(
             "Sample distribution",
-            graph(
-                charts.style(
-                    px.histogram(
-                        samples,
-                        x="trip_distance_miles",
-                        nbins=40,
-                        labels={"trip_distance_miles": "Trip distance (miles)"},
-                        color_discrete_sequence=[charts.BLUE],
-                    )
-                )
-            )
+            graph(charts.sample_distance_histogram(samples))
             if not samples.empty
             else notice("No sampled trips match the current filters."),
-            "Distribution of the displayed sample, not an exact full-dataset histogram.",
+            "Fixed bins for the same selected sample, including points outside the scatter's typical window. The first bin includes zero; each following bin excludes its lower edge and includes its upper edge. The >50-mile bin contains every longer distance. Bar heights are sample counts, not density or full-dataset totals.",
         ),
     ]
 
@@ -329,7 +370,12 @@ def zone_explorer(repo: SnapshotRepository, filters: Filters, destinations, metr
     )
     return [
         notice(
-            "The main zone selection filters endpoint zones on the activity map and origins in the OD views. The destination control applies only to OD connections. OD counts use pickup time."
+            "With no origin or destination selected, all matching zone pairs compete for the "
+            "top positions by trip count. The lines show the busiest recorded connections, "
+            "not a random sample; yellow-taxi activity is concentrated around Manhattan. "
+            "The main zone selection filters endpoint zones on the activity map and origins "
+            "in the OD views. The destination control applies only to OD connections. "
+            "OD counts use pickup time."
         ),
         _coverage(hours),
         panel(
@@ -349,7 +395,7 @@ def zone_explorer(repo: SnapshotRepository, filters: Filters, destinations, metr
         panel(
             "Recorded zone connections",
             graph(charts.flows(connections, zones, repo.max_flows, tiles)),
-            f"Top {min(len(connections), repo.max_flows):,} of {len(connections):,} zone pairs. Lines connect representative zone anchors; they are not actual routes. Line width indicates trip volume. Self-zone trips remain in the table.",
+            f"The {min(len(connections), repo.max_flows):,} largest of {len(connections):,} matching zone pairs, ranked by recorded trip count. Lines connect representative zone anchors, not streets or actual routes. Thicker lines mean more trips. Opposite directions can overlap; within-zone trips appear at one anchor and remain in the table. Hover a connection or use the table to identify its direction.",
         ),
         panel(
             "Origin–destination table",
@@ -393,6 +439,14 @@ def anomalies(repo: SnapshotRepository, filters: Filters):
             "No threshold alerts in this selection. This does not establish that all hours were normal."
         )
     )
+    parameters = repo.manifest.get("config", {}).get("anomalies", {})
+    model = repo.manifest.get("models", {}).get("anomalies", {})
+    scale_floor = parameters.get("scale_floor", 5)
+    minimum_history = parameters.get("min_history", 8)
+    absolute_threshold = parameters.get("absolute_threshold", 20)
+    score_threshold = model.get("calibration", {}).get(
+        "selected_threshold", parameters.get("score_threshold", 4)
+    )
     return [
         notice(
             "Alerts are statistical deviations in recorded pickup activity. They do not establish an incident, fraud, congestion, or a cause. Synthetic test scores are not real-world detection accuracy."
@@ -409,13 +463,33 @@ def anomalies(repo: SnapshotRepository, filters: Filters):
                     html.Div(
                         [
                             html.P(
-                                "Each zone-hour is compared with the median of matching hours of the week in the training period."
+                                "Baseline means the median pickup count for this zone at the "
+                                "same weekday and hour during January–March 2024 training. "
+                                "History means the number of comparable observed training "
+                                "hours, not the number of trips."
                             ),
                             html.P(
-                                "A scaled median absolute deviation provides a robust reference. Both the score threshold and an absolute trip-count threshold must be exceeded."
+                                f"Score = (observed − baseline) / max(1.4826 × MAD, {scale_floor:g}). "
+                                "MAD is the median absolute difference between training counts "
+                                "and their baseline. Positive scores mean more pickups; negative "
+                                "scores mean fewer. A score is not a percentage or probability."
                             ),
                             html.P(
-                                "Calibration and test rows are labeled separately. A score is not a probability or a p-value."
+                                f"A flag requires usable coverage, at least {minimum_history:g} "
+                                f"history hours, an absolute score of at least {score_threshold:g} "
+                                f"and a change of at least {absolute_threshold:g} trips."
+                            ),
+                            html.P(
+                                "Calibration uses April 2024 to choose the threshold. Test uses "
+                                "May–June with that choice frozen. The calibration alert budget "
+                                "controls how many hours are flagged; it is not a false-positive "
+                                "rate. Seasonal change can also produce large scores."
+                            ),
+                            html.P(
+                                "Unreviewed (stored as unresolved) means a person has not yet "
+                                "checked the alert's real-world explanation. The calculation "
+                                "has finished; an alert is not a confirmed incident. This "
+                                "detector monitors pickup counts, not unusual trip durations."
                             ),
                         ]
                     ),
@@ -546,7 +620,16 @@ def performance(repo: SnapshotRepository, timing_scope, backend):
                     .rename(columns={gpu_backend: "gpu_seconds", "cpu": "cpu_seconds"})
                 )
                 comparison["gpu_backend"] = gpu_backend
-                comparison["cpu_over_gpu_speedup"] = comparison.cpu_seconds / comparison.gpu_seconds
+                comparison["cpu_over_gpu_ratio"] = comparison.cpu_seconds / comparison.gpu_seconds
+                comparison["result"] = comparison.cpu_over_gpu_ratio.map(
+                    lambda ratio: (
+                        f"GPU {ratio:.3f}× faster"
+                        if ratio > 1
+                        else f"CPU {1 / ratio:.3f}× faster"
+                        if ratio < 1
+                        else "Equal median time"
+                    )
+                )
                 comparisons.append(comparison)
             if comparisons:
                 speedups = pd.concat(comparisons, ignore_index=True)
@@ -566,12 +649,12 @@ def performance(repo: SnapshotRepository, timing_scope, backend):
         ),
         panel(
             "Matched CPU/GPU comparison",
-            table(speedups)
+            table(speedups, precision=6)
             if not speedups.empty
             else notice("No matching validated CPU and GPU measurements are available yet."),
-            "Speedup = median CPU seconds ÷ median GPU seconds. Values below 1 mean the CPU was faster.",
+            "CPU/GPU ratio = median CPU seconds ÷ median GPU seconds. It stays positive because both times are positive: above 1 means GPU faster, below 1 means CPU faster, and 1 means equal time. A 0.879 ratio means CPU about 1.14× faster. Times and ratios are shown to six decimal places; trailing zeros are display precision, not additional speedup.",
         ),
-        panel("Raw trials", table(data, limit=200)),
+        panel("Raw trials", table(data, limit=200, precision=6)),
         panel(
             "Benchmark environment",
             html.Pre(
@@ -607,6 +690,9 @@ def methods(repo: SnapshotRepository):
         ]
         if c in source_rows
     ]
+    cluster_model = repo.manifest.get("models", {}).get("clustering", {})
+    snapshot_backend = repo.manifest.get("backend", "not recorded")
+    cluster_backend = cluster_model.get("backend", "not recorded")
     return [
         notice(
             "This snapshot is fixed. Date and zone controls do not change provenance, quality totals, model definitions, or benchmark configuration."
@@ -627,6 +713,43 @@ def methods(repo: SnapshotRepository):
                     html.P(
                         "KMeans groups similar feature values; cluster names are interpretations. Anomaly scores compare observed counts with a historical seasonal reference and are not calibrated probabilities."
                     ),
+                ]
+            ),
+        ),
+        panel(
+            "Where the GPU is used and what remains",
+            html.Div(
+                [
+                    html.P(
+                        f"This snapshot's processing backend is {snapshot_backend}; its KMeans "
+                        f"backend is {cluster_backend}. A CPU snapshot uses CPU analysis even when "
+                        "its performance section includes separately measured GPU experiments. "
+                        "Viewing charts does not start a GPU job."
+                    ),
+                    html.P(
+                        "The project's January 2024 validation processed 2,964,624 raw yellow-taxi "
+                        "records on the TITAN RTX: custom CUDA/CuPy numerical features, cuDF "
+                        "endpoint and origin–destination aggregations, and cuML KMeans. "
+                        "Source/schema normalization, timezone checks, quality masks, model "
+                        "scaling and anomaly scoring remain CPU work. The six-month published "
+                        "analysis was built on CPU; the January GPU validation is separate."
+                    )
+                    if repo.manifest.get("data_kind") == "real"
+                    else None,
+                    html.P(
+                        "The anomaly detector covers hourly pickup counts. It does not yet "
+                        "detect unusual trip durations or model unserved demand. The connections "
+                        "map summarizes zone pairs; cuGraph algorithms are not implemented."
+                    ),
+                    html.P(
+                        "Performance measurements compare declared stages, mainly at 100,000 "
+                        "and 1,000,000 rows. The canonical-file aggregation benchmark includes "
+                        "reading, aggregation, necessary transfers and result writes, but excludes "
+                        "raw normalization, models and publication. It is not a timed comparison "
+                        "of the entire six-month system. Host memory is sampled every 10 ms; "
+                        "post-trial GPU pool observations are not a peak-VRAM measurement."
+                    ),
+                    html.P(_cluster_inclusion(cluster_model)),
                 ]
             ),
         ),

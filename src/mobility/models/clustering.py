@@ -17,10 +17,13 @@ from threadpoolctl import threadpool_limits
 
 from .common import (
     FEATURE_NAMES,
+    ML_EXCLUSION_RULES,
     HashSample,
     canonical_batches,
     feature_matrix,
     in_period,
+    ml_filter_parameters,
+    ml_row_masks,
     split_bounds,
     stable_id,
     valid_ml_rows,
@@ -108,6 +111,11 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     parameters = config.get("clustering", {})
+    filter_parameters = ml_filter_parameters(parameters)
+    eligibility_policy = {
+        "version": "fixed_trip_plausibility_v1",
+        "thresholds": filter_parameters,
+    }
     seed = int(parameters.get("seed", 42))
     bounds = split_bounds(config)
     batch_rows = int(config.get("processing", {}).get("batch_rows", 250_000))
@@ -118,10 +126,16 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
         "test": HashSample(evaluation_limit, seed),
     }
     total_rows = 0
+    canonical_eligible_rows = 0
     eligible_rows = 0
+    excluded_by_rule = dict.fromkeys(ML_EXCLUSION_RULES, 0)
     for batch in canonical_batches(canonical_dir, batch_rows):
         total_rows += len(batch)
-        eligible = valid_ml_rows(batch)
+        masks = ml_row_masks(batch, filter_parameters)
+        canonical_eligible_rows += int(masks["canonical_eligible"].sum())
+        for name in ML_EXCLUSION_RULES:
+            excluded_by_rule[name] += int(masks[name].sum())
+        eligible = batch.loc[masks["model_eligible"]].copy()
         eligible_rows += len(eligible)
         for period, sample in samples.items():
             sample.add(eligible.loc[in_period(eligible["pickup_local"], bounds, period)])
@@ -137,8 +151,49 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
         "splits": {key: value.isoformat() for key, value in bounds.items()},
         "samples": {key: sample.metadata() for key, sample in samples.items()},
         "canonical_rows": total_rows,
+        "canonical_eligible_rows": canonical_eligible_rows,
         "eligible_rows": eligible_rows,
         "eligible_fraction": eligible_rows / total_rows if total_rows else 0.0,
+        "eligibility": {
+            "policy_version": eligibility_policy["version"],
+            "thresholds": filter_parameters,
+            "canonical_rows": total_rows,
+            "canonical_eligible_rows": canonical_eligible_rows,
+            "model_eligible_rows": eligible_rows,
+            "excluded_from_canonical_eligible_rows": canonical_eligible_rows - eligible_rows,
+            "excluded_by_rule": excluded_by_rule,
+            "model_eligible_fraction_of_canonical_rows": (
+                eligible_rows / total_rows if total_rows else 0.0
+            ),
+            "model_eligible_fraction_of_canonical_eligible_rows": (
+                eligible_rows / canonical_eligible_rows if canonical_eligible_rows else 0.0
+            ),
+            "exclusion_counting": (
+                "Rule counts apply to canonical-eligible rows and can overlap; "
+                "the total excluded count counts each trip once."
+            ),
+            "scope": (
+                "Clustering only: training, calibration, test, predictions, and plotted trips. "
+                "Raw records, canonical rows, and endpoint/OD aggregates are unchanged."
+            ),
+            "interpretation": (
+                "Fixed study limits, inclusive at the boundary, applied before every model pass. "
+                "These bounds are not learned from the data and are not universal validity rules. "
+                "Mean speed is reported miles divided by elapsed hours, including stops. "
+                "Zero-distance trips remain eligible when their other features pass."
+            ),
+        },
+        "feature_explanation": {
+            "method": "KMeans groups trips by similarity in four standardized features.",
+            "distance": "log(1 + reported trip distance in miles)",
+            "duration": "log(1 + elapsed trip duration in seconds)",
+            "pickup_time": (
+                "Sine and cosine of the local pickup hour; midnight and 11 p.m. are adjacent."
+            ),
+            "standardization": "Feature means and scales are fitted on the training sample only.",
+            "not_features": ["pickup zone", "drop-off zone", "fare", "passenger identity"],
+            "cluster_numbers": "Cluster numbers are arbitrary identifiers, not rankings.",
+        },
         "software": {name: version(name) for name in ["numpy", "pandas", "scikit-learn"]},
     }
     tables = {
@@ -226,6 +281,7 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
 
     model_parameters = {
         "feature_names": FEATURE_NAMES,
+        "eligibility_policy": eligibility_policy,
         "mean": scaler.mean_.tolist(),
         "scale": scaler.scale_.tolist(),
         "centers": np.asarray(model.cluster_centers_).tolist(),
@@ -248,7 +304,9 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
                 output_dir / f"cluster_{period}_sample_ids.parquet", index=False
             )
 
-    plot_sample = HashSample(int(config.get("dashboard", {}).get("max_points", 5000)), seed)
+    plot_sample = HashSample(
+        min(5000, int(config.get("dashboard", {}).get("max_points", 5000))), seed
+    )
     summaries = []
     prediction_rows = 0
     writer = None
@@ -257,7 +315,7 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
     with threadpool_limits(limits=threads):
         try:
             for batch in canonical_batches(canonical_dir, batch_rows):
-                eligible = valid_ml_rows(batch)
+                eligible = valid_ml_rows(batch, filter_parameters)
                 if eligible.empty:
                     continue
                 matrix = scaler.transform(feature_matrix(eligible)).astype(np.float32)
@@ -291,7 +349,7 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
     prediction_seconds = perf_counter() - prediction_start
     plotted = plot_sample.result()
     plotted["inclusion_fraction"] = plot_sample.metadata()["inclusion_fraction"]
-    plotted["sample_design"] = "uniform deterministic hash sample of eligible trips"
+    plotted["sample_design"] = "uniform deterministic hash sample of model-eligible trips"
     plotted[PLOT_COLUMNS].to_parquet(output_dir / tables["trip_plot_sample"], index=False)
     summary = (
         pd.concat(summaries)
@@ -339,8 +397,14 @@ def fit_clusters(canonical_dir: Path, config: dict, output_dir: Path, backend: s
         "prediction_timing_scope": "canonical read, feature/scaler transforms, prediction, assignment write",
         "plot_sample": plot_sample.metadata(),
         "parameters_file": "cluster_parameters.json",
-        "summary_scope": "All feature-eligible canonical rows; static scoring-period summaries.",
-        "median_scope": "Medians use the bounded plot sample; counts and means use all eligible rows.",
+        "summary_scope": (
+            "All canonical-eligible rows that pass the fixed clustering study filters; "
+            "static scoring-period summaries in original miles and minutes."
+        ),
+        "median_scope": (
+            "Medians use the bounded model-eligible plot sample; "
+            "counts and raw means use all model-eligible rows."
+        ),
         "limitations": "Clusters are geometric groupings, not ground-truth passenger categories. Fit timings are diagnostics, not controlled benchmark repetitions.",
     }
     write_json(output_dir / "clustering.json", metadata)

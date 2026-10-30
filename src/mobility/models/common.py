@@ -31,6 +31,17 @@ DEFAULT_SPLITS = {
     "test_start": "2024-05-01",
     "test_end": "2024-07-01",
 }
+DEFAULT_ML_FILTERS = {
+    "max_distance_miles": 100.0,
+    "max_duration_minutes": 180.0,
+    "max_mean_speed_mph": 100.0,
+}
+ML_EXCLUSION_RULES = (
+    "invalid_features",
+    "distance_exceeds_limit",
+    "duration_exceeds_limit",
+    "mean_speed_exceeds_limit",
+)
 
 
 def split_bounds(config: dict) -> dict[str, pd.Timestamp]:
@@ -66,19 +77,61 @@ def canonical_batches(directory: Path, batch_rows: int) -> Iterator[pd.DataFrame
             yield frame
 
 
-def valid_ml_rows(frame: pd.DataFrame) -> pd.DataFrame:
-    """The canonical eligibility decision remains authoritative; guard math too."""
+def ml_filter_parameters(parameters: dict | None = None) -> dict[str, float]:
+    """Fixed study bounds, chosen before fitting and never estimated on future trips."""
+    parameters = parameters or {}
+    limits = {
+        name: float(parameters.get(name, default)) for name, default in DEFAULT_ML_FILTERS.items()
+    }
+    if any(not np.isfinite(value) or value <= 0 for value in limits.values()):
+        raise ValueError("Clustering plausibility limits must be finite and positive.")
+    return limits
+
+
+def ml_row_masks(frame: pd.DataFrame, parameters: dict | None = None) -> dict[str, pd.Series]:
+    """Audit model exclusions without changing canonical rows or their eligibility flags.
+
+    Exclusion masks apply only to canonical-eligible rows and may overlap. Limits
+    are inclusive study choices, not proof that an excluded trip did not occur.
+    Mean speed uses reported distance divided by elapsed time, including stops.
+    """
+    limits = ml_filter_parameters(parameters)
     distance = pd.to_numeric(frame["trip_distance_miles"], errors="coerce")
     duration = pd.to_numeric(frame["duration_seconds"], errors="coerce")
-    valid = (
-        frame["eligible_ml"].fillna(False).astype(bool)
-        & frame["pickup_local"].notna()
+    canonical = frame["eligible_ml"].fillna(False).astype(bool)
+    valid_features = (
+        frame["pickup_local"].notna()
         & np.isfinite(distance)
         & distance.ge(0)
         & np.isfinite(duration)
         & duration.gt(0)
     )
-    return frame.loc[valid].copy()
+    mean_speed = distance / (duration.where(duration.gt(0)) / 3600)
+    masks = {
+        "canonical_eligible": canonical,
+        "invalid_features": canonical & ~valid_features,
+        "distance_exceeds_limit": canonical
+        & np.isfinite(distance)
+        & distance.gt(limits["max_distance_miles"]),
+        "duration_exceeds_limit": canonical
+        & np.isfinite(duration)
+        & duration.gt(limits["max_duration_minutes"] * 60),
+        "mean_speed_exceeds_limit": canonical
+        & np.isfinite(distance)
+        & np.isfinite(duration)
+        & duration.gt(0)
+        & mean_speed.gt(limits["max_mean_speed_mph"]),
+    }
+    excluded = masks[ML_EXCLUSION_RULES[0]].copy()
+    for name in ML_EXCLUSION_RULES[1:]:
+        excluded |= masks[name]
+    masks["model_eligible"] = canonical & ~excluded
+    return masks
+
+
+def valid_ml_rows(frame: pd.DataFrame, parameters: dict | None = None) -> pd.DataFrame:
+    """Return canonical-eligible trips within the fixed clustering study bounds."""
+    return frame.loc[ml_row_masks(frame, parameters)["model_eligible"]].copy()
 
 
 def feature_matrix(frame: pd.DataFrame) -> np.ndarray:

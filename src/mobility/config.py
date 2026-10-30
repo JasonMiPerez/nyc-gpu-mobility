@@ -61,6 +61,10 @@ class ClusterConfig(StrictModel):
     k_values: list[int] = Field(default_factory=lambda: [4, 6, 8])
     training_max_rows: int = Field(200_000, ge=10, le=5_000_000)
     evaluation_max_rows: int = Field(2000, ge=10, le=5000)
+    # Study restrictions for clustering; endpoint counts retain their own eligibility.
+    max_distance_miles: float = Field(100.0, gt=0)
+    max_duration_minutes: float = Field(180.0, gt=0)
+    max_mean_speed_mph: float = Field(100.0, gt=0)
     seed: int = 42
 
     @model_validator(mode="after")

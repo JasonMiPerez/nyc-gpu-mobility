@@ -109,8 +109,10 @@ in a config to integrate the custom kernel. GPU-unavailable errors remain errors
 Read [methods](docs/methods.md) for analytical definitions and limitations,
 [GPU setup](docs/gpu.md) for server work, and [deployment](docs/deployment.md)
 for public/static and Python hosting. [Case studies](docs/case-studies.md) explain
-three real alerts, and [release results](docs/release-results.md) summarize the
-measured validation and benchmark evidence. Dataset source: the
+three real alerts, [release results](docs/release-results.md) summarize the
+measured validation and benchmark evidence, and the
+[proposal audit](docs/proposal-coverage.md) distinguishes completed components
+from remaining work. Dataset source: the
 [official NYC TLC catalog](https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page).
 
 ## Scope
@@ -118,7 +120,8 @@ measured validation and benchmark evidence. Dataset source: the
 Custom CUDA is part of the implemented system. Team size and semester schedules
 are not requirements. Yellow taxis are the supported source adapter; ride-hailing,
 weather, graph algorithms, distributed execution, and multi-GPU processing remain
-optional extensions. The code fails explicitly for unsupported source families.
+unimplemented. The proposal's cuGraph component and travel-duration anomalies
+still need implementation. The code fails explicitly for unsupported source families.
 
 All benchmark claims must identify their workload and timing scope. A faster
 kernel does not imply an equally fast full pipeline. The public static snapshot

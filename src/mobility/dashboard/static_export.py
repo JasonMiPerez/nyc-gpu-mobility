@@ -24,10 +24,12 @@ MAX_ALERTS = 100
 MAX_INCIDENTS = 200
 
 
-def _records(frame: pd.DataFrame, columns=None) -> list[dict]:
+def _records(frame: pd.DataFrame, columns=None, *, precision=6) -> list[dict]:
     if columns is not None:
         frame = frame[[column for column in columns if column in frame]]
-    return json.loads(frame.to_json(orient="records", date_format="iso", double_precision=6))
+    return json.loads(
+        frame.to_json(orient="records", date_format="iso", double_precision=precision)
+    )
 
 
 def _model_summary(models: dict) -> dict:
@@ -55,12 +57,31 @@ def _model_summary(models: dict) -> dict:
         "scale_floor",
         "calibration_status",
         "evaluation_status",
+        "backend",
+        "preprocessing_backend",
+        "eligible_fraction",
+        "canonical_eligible_rows",
+        "threshold",
+        "metric",
+        "computation_backend",
+        "score_meaning",
+        "manual_review_status",
+    }
+    # These structures are generated explanations and numeric policy values.
+    # Training samples, record identities, paths and software environments stay private.
+    explanatory = {
+        "eligibility",
+        "feature_explanation",
+        "splits",
+        "anomalies_config",
+        "calibration",
     }
     return {
         name: {
             key: value
             for key, value in model.items()
-            if key in allowed and isinstance(value, (str, int, float, bool, list, type(None)))
+            if (key in allowed and isinstance(value, (str, int, float, bool, list, type(None))))
+            or (key in explanatory and isinstance(value, dict))
         }
         for name, model in models.items()
         if isinstance(model, dict)
@@ -211,7 +232,7 @@ def _benchmark_payload(repo: SnapshotRepository, trials: pd.DataFrame) -> dict:
                     )
                     frame["gpu_backend"] = backend
                     frame["speedup"] = frame.cpu_seconds / frame.gpu_seconds
-                    comparisons.extend(_records(frame))
+                    comparisons.extend(_records(frame, precision=12))
     return {
         "trials": _records(
             trials.head(2000),
@@ -239,6 +260,7 @@ def _benchmark_payload(repo: SnapshotRepository, trials: pd.DataFrame) -> dict:
                 "cache_condition",
                 "memory_measurement",
             ],
+            precision=12,
         ),
         "total_trials": len(trials),
         "display_limit": 2000,
@@ -375,6 +397,18 @@ def export_public(snapshot_dir: Path, destination_dist: Path) -> Path:
         "study_end": repo.manifest["study_end"],
         "dataset": repo.default_filters().dataset,
         "models": _model_summary(repo.manifest.get("models", {})),
+        "splits": repo.manifest.get("config", {}).get("splits", {}),
+        "anomaly_parameters": repo.manifest.get("config", {}).get("anomalies", {}),
+        "processing": {
+            "aggregation_backend": repo.manifest.get("config", {})
+            .get("processing", {})
+            .get("backend", "unknown"),
+            "clustering_backend": repo.manifest.get("models", {})
+            .get("clustering", {})
+            .get("backend", "unknown"),
+            "anomaly_backend": "cpu",
+            "browser_execution": "Precomputed snapshot; no GPU jobs run in the browser.",
+        },
         "time_convention": "America/New_York — source local wall time",
         "export_kind": "static_published_snapshot",
         "max_flows": repo.max_flows,

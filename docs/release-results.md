@@ -3,6 +3,37 @@
 These observations were recorded on October 30, 2026. They are measured results,
 not proposed targets from the original specification.
 
+## Chart and clustering correction
+
+The current clustering run is `20261030T193520-94b28e21`, model
+`kmeans-10a1a53e43121915`. A plotted source value of 100,125.14 miles in 13 minutes
+exposed an overly permissive clustering policy and an unreadable linear axis.
+Clustering now restricts reported distance to 100 miles, duration to 180 minutes
+and mean speed to 100 mph. These are inclusive study bounds, not universal
+validity claims. They exclude 18,290 of the 20,248,369 previously eligible rows
+(0.09033%), leaving 20,230,079 model-eligible trips. The original records and all
+pickup/drop-off/OD counts are unchanged.
+
+The refit still selects six clusters. Its 2,000-trip May–June evaluation has a
+silhouette of 0.3041. Because the policy revision followed inspection of the
+published full-period sample, this is a retrospective chronological holdout
+result, not fresh unseen confirmation. A new untouched period is needed for
+that claim. Cluster numbers were reassigned and should not be compared by ID
+with the earlier model. Anomaly results and all historical benchmark timings
+were preserved without rerunning them.
+
+The chart now defaults to 0–50 miles and 0–120 minutes, identifies the three
+sampled trips outside that view, and offers full-range inspection. Public charts
+also offer zero-preserving logarithmic spacing. All 5,000 new sampled distances
+are present, including 75 reported zero distances. Sample distance bands include
+an overflow category. OD lines have top-N selection and scope explanations;
+anomaly definitions and CPU/GPU winner labels are explicit.
+
+Current verification: 105 CPU tests passed, six GPU-only tests skipped on the Mac.
+The original release measurements below remain a historical record; GPU trials
+were not rerun for this interface/model correction. See
+[proposal-coverage.md](proposal-coverage.md) for the remaining proposal gaps.
+
 ## Data and analysis
 
 CPU study run: `20261030T141931-b2c5ac43`.

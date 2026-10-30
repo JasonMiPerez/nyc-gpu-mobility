@@ -7,6 +7,30 @@
   --accent: #2854c5;
   --teal: #0f766e;
 }
+.map-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.map-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.map-legend i {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.origin-dot {
+  background: var(--accent);
+}
+.destination-dot {
+  background: var(--teal);
+}
 [hidden] {
   display: none !important;
 }

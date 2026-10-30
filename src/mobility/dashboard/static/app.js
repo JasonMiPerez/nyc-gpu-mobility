@@ -73,6 +73,82 @@ const sum = (rows, key) =>
 const observedSum = (rows, key) =>
   rows.some((row) => row[key] != null) ? sum(rows, key) : null;
 
+// View limits change the picture only; the published records remain available.
+function sampleSelection(rows, mode) {
+  const valid = rows.filter(
+    (row) =>
+      Number.isFinite(row.trip_distance_miles) &&
+      row.trip_distance_miles >= 0 &&
+      Number.isFinite(row.duration_seconds) &&
+      row.duration_seconds >= 0,
+  );
+  const shown = mode === "typical"
+    ? valid.filter((row) => row.trip_distance_miles <= 50 && row.duration_seconds <= 7200)
+    : valid;
+  return { valid, shown, outside: valid.length - shown.length, invalid: rows.length - valid.length };
+}
+
+function sampleDistanceBins(rows) {
+  const edges = [1, 2, 3, 5, 10, 20, 50];
+  const labels = ["0–<1", "1–<2", "2–<3", "3–<5", "5–<10", "10–<20", "20–50", ">50"];
+  const counts = labels.map(() => 0);
+  for (const row of rows) {
+    const distance = row.trip_distance_miles;
+    if (!Number.isFinite(distance) || distance < 0) continue;
+    const index = edges.findIndex((edge, i) => i === edges.length - 1 ? distance <= edge : distance < edge);
+    counts[index === -1 ? edges.length : index] += 1;
+  }
+  return { labels, counts };
+}
+
+function logAxis(values, title) {
+  const largest = Math.max(1, ...values);
+  const ticks = [0];
+  for (let power = 1; power <= largest * 10; power *= 10) {
+    for (const factor of [1, 2, 5]) {
+      const tick = power * factor;
+      if (tick <= largest) ticks.push(tick);
+    }
+  }
+  return {
+    title: { text: `${title} · log(1 + value) spacing` },
+    tickvals: ticks.map(Math.log1p),
+    ticktext: ticks.map((value) => number(value)),
+    rangemode: "tozero",
+  };
+}
+
+function comparisonDisplay(row) {
+  const ratio = row.cpu_seconds > 0 && row.gpu_seconds > 0
+    ? row.cpu_seconds / row.gpu_seconds
+    : null;
+  return {
+    ...row,
+    cpu_seconds: number(row.cpu_seconds, 6),
+    gpu_seconds: number(row.gpu_seconds, 6),
+    time_ratio: ratio == null ? "—" : `${number(ratio, 3)}×`,
+    faster: ratio == null ? "Unavailable" : ratio === 1 ? "Equal measured times" :
+      `${ratio > 1 ? "GPU" : "CPU"} faster · ${number(ratio > 1 ? ratio : 1 / ratio, 2)}×`,
+  };
+}
+
+function periodLabel(splits, prefix) {
+  const start = new Date(`${dateOnly(splits[`${prefix}_start`])}T00:00:00Z`);
+  const end = new Date(`${dateOnly(splits[`${prefix}_end`])}T00:00:00Z`);
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) return "See model metadata";
+  end.setUTCDate(end.getUTCDate() - 1);
+  const format = { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" };
+  return `${start.toLocaleDateString("en-US", format)} – ${end.toLocaleDateString("en-US", format)}`;
+}
+
+function modelSplits() {
+  return state.summary.meta.splits || state.summary.meta.models?.anomalies?.splits || {
+    train_start: "2024-01-01", train_end: "2024-04-01",
+    calibration_start: "2024-04-01", calibration_end: "2024-05-01",
+    test_start: "2024-05-01", test_end: "2024-07-01",
+  };
+}
+
 function table(rows, columns, limit = 100) {
   if (!rows.length) return notice("No rows are available for this selection.");
   const cells = (value) =>
@@ -281,8 +357,8 @@ async function overview(request) {
     .sort((a, b) => (b.pickups ?? -1) - (a.pickups ?? -1));
   const active = totals.filter((row) => row.pickups > 0).length;
   const cards = [
-    ["Mapped pickups", number(pickups), "Eligible recorded origins"],
-    ["Mapped drop-offs", number(dropoffs), "Eligible recorded destinations"],
+    ["Mapped pickups", number(pickups), "Recorded trip starts in known zones"],
+    ["Mapped drop-offs", number(dropoffs), "Recorded trip ends in known zones"],
     [
       "Mean valid duration",
       durationN
@@ -298,6 +374,9 @@ async function overview(request) {
     `<span class="muted">Daily aggregates · NYC source local time</span><button id="export" class="button secondary export-button">Export selected daily data</button>`;
   byId("page-content").innerHTML =
     `<div class="kpi-grid">${cards.map(([label, value, detail]) => `<div class="kpi"><p class="kpi-label">${label}</p><strong class="kpi-value">${value}</strong><p class="kpi-detail">${detail}</p></div>`).join("")}</div>` +
+    notice(
+      "One pickup is the start of one recorded taxi trip; one drop-off is its end. These count trips, not passengers. ‘Mapped’ means the endpoint has a valid time and a known taxi zone. Each total uses its own endpoint time and the selected dates and zones, so the two totals need not match.",
+    ) +
     notice(
       `Pickup coverage: ${number(observed)} of ${number(possible)} selected zone-hours observed. Missing and DST-excluded hours are not zero activity. Drop-off totals have partial source context: earlier pickup files can contain additional arrivals.`,
       observed < possible ? "warning" : "info",
@@ -410,12 +489,19 @@ async function patterns(request) {
     ...new Set(data.samples.map((row) => String(row.cluster))),
   ].sort();
   byId("view-controls").innerHTML =
-    `<div class="compact-control"><label for="sample-cluster">Sample cluster</label><select id="sample-cluster"><option value="all">All clusters</option>${clusters.map((value) => `<option value="${escapeHtml(value)}">Cluster ${escapeHtml(value)}</option>`).join("")}</select></div><span class="muted">All dates and zones in this fixed snapshot</span>`;
+    `<div class="compact-control"><label for="sample-cluster">Sample cluster</label><select id="sample-cluster"><option value="all">All clusters</option>${clusters.map((value) => `<option value="${escapeHtml(value)}">Cluster ${escapeHtml(value)}</option>`).join("")}</select></div><div class="wide-control"><label for="sample-view">Scatterplot view</label><select id="sample-view"><option value="typical">Typical trip view · 0–50 mi, 0–120 min</option><option value="full">Full range · linear axes</option><option value="log">Full range · log(1 + value) axes</option></select></div><span class="muted">All dates and zones in this fixed snapshot</span>`;
   const status = state.summary.meta.models?.clustering?.status;
+  const clusterCount = state.summary.meta.models?.clustering?.selected_k;
+  const eligibility = state.summary.meta.models?.clustering?.eligibility;
   byId("page-content").innerHTML =
     notice(
       "Patterns and cluster summaries describe the full published period. The cluster selector filters only the sampled plots; it does not change the full-population cluster table.",
     ) +
+    (eligibility
+      ? notice(
+          `Clustering uses ${number(eligibility.model_eligible_rows)} eligible trips. Model-only limits: at most ${number(eligibility.thresholds.max_distance_miles)} miles, ${number(eligibility.thresholds.max_duration_minutes)} minutes, and ${number(eligibility.thresholds.max_mean_speed_mph)} mph mean speed. ${number(eligibility.excluded_from_canonical_eligible_rows)} otherwise eligible trips are excluded from clustering under these study limits. Their valid pickup/drop-off counts remain in the activity totals. These limits do not certify that every retained trip is correct.`,
+        )
+      : "") +
     (status === "exploratory_no_calibration"
       ? notice(
           "Exploratory clustering: this snapshot has no separate calibration period, so the selected cluster count has not been validated on a calibration period.",
@@ -442,17 +528,17 @@ async function patterns(request) {
         ],
         20,
       ),
-      "Cluster numbers identify feature-based groups, not known passenger types. Counts and raw-unit means refer to the declared scoring period.",
+      `KMeans groups trips by log(1 + distance), log(1 + duration), and pickup hour encoded around a 24-hour circle, so 23:00 and 00:00 are close. Features are standardized using training data only. ${status === "calibration_selected" ? `${clusterCount ? `${clusterCount} groups were` : "The group count was"} selected on calibration data (${periodLabel(modelSplits(), "calibration")}) after fitting on training data (${periodLabel(modelSplits(), "train")}).` : "See model status for the fitting and selection periods."} Zone IDs are not clustering inputs. Group numbers are arbitrary labels, not neighborhoods or known passenger purposes. Counts and means describe eligible trips in the scoring period.`,
     ) +
     panel(
       "Distance and duration",
-      chartDiv("sample-scatter"),
-      `At most ${number(state.summary.meta.max_points)} sampled feature pairs. Sample counts are not population totals; no traveler or source-record identifiers are exported.`,
+      `<div id="sample-view-summary"></div>${chartDiv("sample-scatter")}`,
+      `Each point is one sampled trip, colored by its cluster. At most ${number(state.summary.meta.max_points)} feature pairs are published. The default view makes ordinary distances readable; choose a full-range view to inspect outliers. Log spacing retains zero values and shows original units in hover labels.`,
     ) +
     panel(
       "Sample distance distribution",
       chartDiv("sample-histogram"),
-      "A distribution of the displayed sample, not an exact full-population histogram.",
+      "All valid trips in the selected sample cluster are counted here, including trips outside the scatterplot view. Fixed distance bands and an overflow bar prevent a single extreme distance from stretching the chart. These are sample counts, not population totals.",
     );
   if (data.histograms?.length) {
     byId("page-content").insertAdjacentHTML(
@@ -519,18 +605,25 @@ async function patterns(request) {
     const selected = byId("sample-cluster").value,
       rows = data.samples.filter(
         (row) => selected === "all" || String(row.cluster) === selected,
-      );
-    if (!rows.length) {
+      ),
+      mode = byId("sample-view").value,
+      selection = sampleSelection(rows, mode),
+      useLog = mode === "log";
+    byId("sample-view-summary").innerHTML = notice(
+      `${mode === "typical" ? "Typical trip view: 0–50 miles and 0–120 minutes" : useLog ? "Full range with log(1 + value) spacing" : "Full range with linear axes"}. Showing ${number(selection.shown.length)} of ${number(selection.valid.length)} valid selected sample trips; ${number(selection.outside)} are outside this view. ${number(selection.invalid)} selected rows have invalid coordinates. The distance histogram includes all ${number(selection.valid.length)} valid selected trips.`,
+    );
+    if (!selection.valid.length) {
       emptyPlot("sample-scatter", "No sampled trips for this selection.");
       emptyPlot("sample-histogram", "No sampled trips for this selection.");
       return;
     }
-    const traces = [...groupRows(rows, "cluster")].map(
+    const traces = [...groupRows(selection.shown, "cluster")].map(
       ([cluster, values], i) => ({
         type: "scattergl",
         mode: "markers",
-        x: values.map((row) => row.trip_distance_miles),
-        y: values.map((row) => row.duration_seconds / 60),
+        x: values.map((row) => useLog ? Math.log1p(row.trip_distance_miles) : row.trip_distance_miles),
+        y: values.map((row) => useLog ? Math.log1p(row.duration_seconds / 60) : row.duration_seconds / 60),
+        customdata: values.map((row) => [row.trip_distance_miles, row.duration_seconds / 60]),
         name: `Cluster ${cluster}`,
         marker: {
           color:
@@ -540,53 +633,65 @@ async function patterns(request) {
           opacity: 0.5,
         },
         hovertemplate:
-          "Distance %{x:.2f} mi<br>Duration %{y:.1f} min<extra>%{fullData.name}</extra>",
+          "Distance %{customdata[0]:,.2f} mi<br>Duration %{customdata[1]:,.1f} min<extra>%{fullData.name}</extra>",
       }),
     );
     plot("sample-scatter", traces, {
       height: 400,
-      xaxis: { title: { text: "Trip distance (miles)" } },
-      yaxis: {
+      uirevision: `${state.summary.meta.snapshot_id}-${mode}-${selected}`,
+      xaxis: useLog ? logAxis(selection.shown.map((row) => row.trip_distance_miles), "Trip distance (miles)") : {
+        title: { text: "Trip distance (miles)" },
+        rangemode: "tozero",
+        ...(mode === "typical" ? { range: [0, 50] } : {}),
+      },
+      yaxis: useLog ? logAxis(selection.shown.map((row) => row.duration_seconds / 60), "Trip duration (minutes)") : {
         title: { text: "Trip duration (minutes)" },
         rangemode: "tozero",
+        ...(mode === "typical" ? { range: [0, 120] } : {}),
       },
     });
+    const bins = sampleDistanceBins(selection.valid);
     plot(
       "sample-histogram",
       [
         {
-          type: "histogram",
-          x: rows.map((row) => row.trip_distance_miles),
-          nbinsx: 40,
-          marker: { color: blue },
+          type: "bar",
+          x: bins.labels,
+          y: bins.counts,
+          marker: { color: bins.labels.map((label, index) => index === bins.labels.length - 1 ? "#9a3412" : blue) },
+          hovertemplate: "%{x} miles<br>%{y:,} sampled trips<extra></extra>",
         },
       ],
       {
-        xaxis: { title: { text: "Trip distance (miles)" } },
+        xaxis: { title: { text: "Trip distance bands (miles) · >50 is overflow" }, type: "category" },
         yaxis: {
-          title: { text: "Displayed sample count" },
+          title: { text: "Selected sample trips" },
           rangemode: "tozero",
         },
       },
     );
   }
   byId("sample-cluster").onchange = drawSample;
+  byId("sample-view").onchange = drawSample;
   drawSample();
 }
 
 async function zones(request) {
   const data = await load("od.json");
   if (request !== state.request) return;
+  const pairCap = state.summary.meta.max_flows || 200;
+  const pairLimits = [25, 50, 100, 200].filter((limit) => limit <= pairCap);
+  if (!pairLimits.length) pairLimits.push(pairCap);
   byId("view-controls").innerHTML =
-    `<div class="wide-control"><label for="od-origin">Origin zone</label><select id="od-origin">${zoneOptions("All origins")}</select></div><div class="wide-control"><label for="od-destination">Destination zone</label><select id="od-destination">${zoneOptions("All destinations")}</select></div>`;
+    `<div class="wide-control"><label for="od-origin">Origin zone</label><select id="od-origin">${zoneOptions("All origins")}</select></div><div class="wide-control"><label for="od-destination">Destination zone</label><select id="od-destination">${zoneOptions("All destinations")}</select></div><div class="compact-control"><label for="od-limit">Busiest pairs to show</label><select id="od-limit">${pairLimits.map((limit) => `<option value="${limit}"${limit === Math.min(50, pairCap) ? " selected" : ""}>Top ${limit}</option>`).join("")}</select></div>`;
   byId("page-content").innerHTML =
     notice(
-      "OD connections are aggregated over the entire published period. Date filtering is unavailable in this static view; the full Dash application supports hourly/date-specific OD queries. Origin and destination filters below are exact for this saved period.",
+      "With all origins and destinations selected, this view ranks ordered zone pairs by recorded trip count over the entire published period. A → B and B → A are separate pairs. The busiest 50 are selected by default. Date filtering is unavailable in this public snapshot; the full Dash application supports date-specific queries.",
     ) +
     panel(
       "Recorded zone connections",
-      chartDiv("flow-map"),
-      "Lines connect representative zone anchors, not actual routes. Self-zone trips remain in the table but cannot appear as a visible line.",
+      `<div id="od-summary"></div><p class="map-legend"><span><i class="origin-dot"></i> Pickup endpoint</span><span><i class="destination-dot"></i> Drop-off endpoint</span><span>Thicker line = more trips</span></p>${chartDiv("flow-map")}`,
+      "Straight lines connect representative points inside each zone; they are not street routes. Hover an endpoint for the direction and trip count. Within-zone pairs remain in the table but do not form a visible line.",
     ) +
     panel(
       "Origin–destination table",
@@ -606,11 +711,22 @@ async function zones(request) {
             Number(row.dropoff_zone_id) === Number(destination)),
       )
       .sort((a, b) => b.trip_count - a.trip_count);
-    const limit = state.summary.meta.max_flows,
+    const limit = Math.min(pairCap, Number(byId("od-limit").value)),
       shown = rows.slice(0, limit);
+    const allTrips = sum(data.connections, "trip_count"),
+      matchingTrips = sum(rows, "trip_count"),
+      shownTrips = sum(shown, "trip_count"),
+      withinZone = shown.filter((row) => Number(row.pickup_zone_id) === Number(row.dropoff_zone_id)),
+      zonesById = new Map(state.summary.zones.map((zone) => [Number(zone.zone_id), zone])),
+      manhattanTrips = sum(shown.filter((row) =>
+        zonesById.get(Number(row.pickup_zone_id))?.borough === "Manhattan" &&
+        zonesById.get(Number(row.dropoff_zone_id))?.borough === "Manhattan"), "trip_count");
+    byId("od-summary").innerHTML = notice(
+      `Showing ${number(shown.length)} of ${number(rows.length)} matching ordered pairs, covering ${number(shownTrips)} trips: ${number(allTrips ? 100 * shownTrips / allTrips : 0, 1)}% of all eligible OD trips and ${number(matchingTrips ? 100 * shownTrips / matchingTrips : 0, 1)}% of trips matching these filters. ${number(shownTrips ? 100 * manhattanTrips / shownTrips : 0, 1)}% of shown trips have both endpoints in Manhattan, which explains the concentration when that share is high. ${number(withinZone.length)} shown pairs begin and end in the same zone (${number(sum(withinZone, "trip_count"))} trips); they have no visible connecting line.`,
+    );
     byId("od-table").innerHTML =
       notice(
-        `Showing the top ${number(shown.length)} of ${number(rows.length)} matching zone pairs; the map and table have the same ${number(limit)}-pair limit.`,
+        `The map and table use the same top ${number(shown.length)} zone pairs, ranked by trip count.`,
       ) +
       table(
         shown.map((row) => ({
@@ -655,24 +771,23 @@ async function zones(request) {
       });
     const largest = Math.max(1, ...shown.map((row) => row.trip_count));
     for (const row of shown) {
-      const a = state.summary.zones.find(
-          (zone) => zone.zone_id === row.pickup_zone_id,
-        ),
-        b = state.summary.zones.find(
-          (zone) => zone.zone_id === row.dropoff_zone_id,
-        );
+      const a = zonesById.get(Number(row.pickup_zone_id)),
+        b = zonesById.get(Number(row.dropoff_zone_id));
       if (!a || !b || a.latitude == null || b.latitude == null) continue;
+      const connection = `${escapeHtml(zoneName(row.pickup_zone_id))} → ${escapeHtml(zoneName(row.dropoff_zone_id))}<br>${number(row.trip_count)} recorded trips`;
       traces.push({
         type: "scattermap",
         lat: [a.latitude, b.latitude],
         lon: [a.longitude, b.longitude],
-        mode: "lines",
+        mode: "lines+markers",
+        marker: { size: [8, 6], color: [blue, teal], opacity: 0.9 },
+        text: [`Pickup endpoint<br>${connection}`, `Drop-off endpoint<br>${connection}`],
         line: {
           width: 0.8 + 3.5 * Math.sqrt(row.trip_count / largest),
           color: blue,
         },
-        opacity: 0.45,
-        hoverinfo: "skip",
+        opacity: 0.6,
+        hovertemplate: "%{text}<extra></extra>",
         showlegend: false,
       });
     }
@@ -688,12 +803,21 @@ async function zones(request) {
   }
   byId("od-origin").onchange = draw;
   byId("od-destination").onchange = draw;
+  byId("od-limit").onchange = draw;
   await draw();
 }
 
 async function anomalies(request) {
   const data = await load("anomalies.json");
   if (request !== state.request) return;
+  const anomalyModel = state.summary.meta.models?.anomalies || {};
+  const parameters = anomalyModel.anomalies_config || state.summary.meta.anomaly_parameters || anomalyModel.parameters || {};
+  const scoreThreshold = anomalyModel.threshold ?? data.alerts[0]?.threshold ?? parameters.score_threshold ?? 4;
+  const countThreshold = parameters.absolute_threshold ?? data.alerts[0]?.absolute_threshold ?? 20;
+  const scaleFloor = parameters.scale_floor ?? 5;
+  const minHistory = parameters.min_history ?? 8;
+  const splits = modelSplits();
+  const splitLabel = (split) => ({ calibration: "Calibration", test: "Test", train: "Training" })[split] || split;
   byId("view-controls").innerHTML =
     `<div class="wide-control"><label for="alert-zone">Zone · exported alerts only</label><select id="alert-zone">${zoneOptions()}</select></div>`;
   byId("page-content").innerHTML =
@@ -702,6 +826,10 @@ async function anomalies(request) {
     ) +
     notice(
       `This public snapshot exports the ${number(data.alert_limit)} largest alert hours and at most ${number(data.incident_limit)} merged incidents from the full period. Zone filtering selects within that bounded export; it does not rerank all underlying records.`,
+    ) +
+    panel(
+      "How to read an alert",
+      `<p><strong>Training (${escapeHtml(periodLabel(splits, "train"))})</strong> establishes the historical baseline. <strong>Calibration (${escapeHtml(periodLabel(splits, "calibration"))})</strong> is the separate period used to check detector choices. <strong>Test (${escapeHtml(periodLabel(splits, "test"))})</strong> evaluates the frozen detector on later data. A test alert is not automatically a verified event.</p><p><strong>Observed</strong> is the number of recorded pickups in one zone during one hour. <strong>Baseline</strong> is that zone’s median pickup count for the same weekday and hour in the training period. <strong>History</strong> counts the matching training observations used, not the number of past alerts.</p><p><code>score = (observed − baseline) / max(1.4826 × MAD, ${number(scaleFloor)})</code></p><p>MAD is the median absolute deviation of those historical counts from their median. The minimum scale of ${number(scaleFloor)} prevents small baselines from producing unstable scores. A positive score means more pickups than usual; a negative score means fewer. An alert requires both <strong>|score| ≥ ${number(scoreThreshold)}</strong> and an absolute difference of at least <strong>${number(countThreshold)} pickups</strong>, with at least <strong>${number(minHistory)} matching historical observations</strong>. The score is not a percentage, probability, or explanation of the cause.</p>`,
     ) +
     panel(
       "Scoring coverage",
@@ -724,7 +852,7 @@ async function anomalies(request) {
     panel(
       "Merged incidents",
       `<div id="incident-table"></div>`,
-      "Adjacent alerts are merged using the saved detector policy. Labels remain unresolved unless independently reviewed.",
+      "Adjacent alert hours are grouped into candidate incidents using the saved detector policy. Unreviewed means no independent evidence has confirmed or explained the event; it is the display name for the saved ‘unresolved’ label.",
     );
   function drawContext() {
     const id = byId("alert-choice").value,
@@ -782,28 +910,28 @@ async function anomalies(request) {
       ? alerts
           .map(
             (row) =>
-              `<option value="${row.context_id}">${escapeHtml(zoneName(row.zone_id))} · ${escapeHtml(row.hour.slice(0, 16).replace("T", " "))} · score ${number(row.score, 2)} · ${escapeHtml(row.split)}</option>`,
+              `<option value="${row.context_id}">${escapeHtml(zoneName(row.zone_id))} · ${escapeHtml(row.hour.slice(0, 16).replace("T", " "))} · score ${number(row.score, 2)} · ${escapeHtml(splitLabel(row.split))}</option>`,
           )
           .join("")
       : `<option value="">No exported alerts in this selection</option>`;
     byId("alert-choice").disabled = !alerts.length;
     byId("alert-table").innerHTML = table(
-      alerts.map((row) => ({ ...row, zone: zoneName(row.zone_id) })),
+      alerts.map((row) => ({ ...row, zone: zoneName(row.zone_id), split: splitLabel(row.split) })),
       [
         ["zone", "Zone"],
         ["hour", "Local hour"],
         ["split", "Split"],
-        ["observed", "Observed"],
-        ["baseline", "Baseline"],
+        ["observed", "Observed pickups"],
+        ["baseline", "Baseline pickups"],
         ["score", "Score"],
         ["threshold", "Threshold"],
-        ["history_count", "History"],
+        ["history_count", "Matching historical hours"],
       ],
       data.alert_limit,
     );
     const incidents = data.incidents
       .filter((row) => zone === "all" || Number(row.zone_id) === Number(zone))
-      .map((row) => ({ ...row, zone: zoneName(row.zone_id) }));
+      .map((row) => ({ ...row, zone: zoneName(row.zone_id), label: row.label === "unresolved" ? "Unreviewed" : row.label }));
     byId("incident-table").innerHTML = table(
       incidents,
       [
@@ -841,11 +969,18 @@ async function renderPerformance(request) {
   }
   const scopes = [...new Set(data.trials.map((row) => row.timing_scope))],
     backends = [...new Set(data.trials.map((row) => row.backend))];
+  const processing = state.summary.meta.processing || {
+    aggregation_backend: "cpu", clustering_backend: "cpu", anomaly_backend: "cpu",
+  };
   byId("view-controls").innerHTML =
     `<div class="compact-control"><label for="trial-scope">Timing scope</label><select id="trial-scope"><option value="all">All scopes</option>${scopes.map((scope) => `<option>${escapeHtml(scope)}</option>`).join("")}</select></div><div class="compact-control"><label for="trial-backend">Backend</label><select id="trial-backend"><option value="all">All backends</option>${backends.map((backend) => `<option>${escapeHtml(backend)}</option>`).join("")}</select></div>`;
   byId("page-content").innerHTML =
     notice(
       `Published trials: ${number(data.total_trials)}. This static export includes at most ${number(data.display_limit)} raw trials. Date and zone filters do not apply; compare matching experiment, input size, stage, and timing scope.`,
+    ) +
+    panel(
+      "Where the GPU was used",
+      `<p>Published snapshot backends: <strong>aggregations ${escapeHtml(processing.aggregation_backend.toUpperCase())}</strong>, <strong>clustering ${escapeHtml(processing.clustering_backend.toUpperCase())}</strong>, and <strong>pickup-volume anomalies ${escapeHtml(processing.anomaly_backend.toUpperCase())}</strong>. These are the six-month January–June results shown on this site.</p><p>A separate January run of about 2.96 million source records used the NVIDIA TITAN RTX server for CUDA trip-feature calculations, cuDF filtering and aggregations, and cuML clustering. That January clustering was exploratory: it had no April calibration data. The matched CPU/GPU timings below were measured on that server.</p><p>Source loading and schema/time validation still use CPU work. The seasonal pickup-volume anomaly detector runs on the CPU. The zone-connection map displays saved origin–destination counts; no cuGraph graph algorithm has been run. Opening this site displays saved results and does not start a GPU job.</p><p>Benchmarks retain the configurations used when they were measured. They have not been rerun with the revised cluster plausibility limits and do not measure a matched CPU/GPU run of the full six-month dataset.</p>`,
     ) +
     panel(
       "Measured elapsed time",
@@ -855,7 +990,7 @@ async function renderPerformance(request) {
     panel(
       "Matched CPU/GPU comparisons",
       `<div id="speedup-table"></div>`,
-      "Speedup uses medians over all published validated trials, not just the bounded raw-trial display. Matching experiment, workload, and timing scope are required. A value below 1 means the CPU was faster.",
+      "CPU time / GPU time is a ratio of median seconds across all validated trials. It is always positive: above 1 means the GPU was faster; below 1 means the CPU was faster; 1 means equal times. The faster-backend column expresses the advantage for the winner (for example, a ratio of 0.5 means CPU faster by 2×). Seconds have six decimal places; original measurements remain in data/performance.json.",
     ) +
     panel("Raw trials", `<div id="trial-table"></div>`) +
     panel(
@@ -899,7 +1034,7 @@ async function renderPerformance(request) {
         size: 8,
       },
       hovertemplate:
-        "%{x}<br>%{y:.5f} seconds<br>%{text}<extra>%{fullData.name}</extra>",
+        "%{x}<br>%{y:.6f} seconds<br>%{text}<extra>%{fullData.name}</extra>",
     }));
     if (traces.length)
       plot("trial-chart", traces, {
@@ -918,20 +1053,22 @@ async function renderPerformance(request) {
         (backend === "all" || backend === "cpu" || row.gpu_backend === backend),
     );
     byId("speedup-table").innerHTML = comparisons.length
-      ? table(comparisons, [
+      ? table(comparisons.map(comparisonDisplay), [
+          ["experiment_id", "Experiment"],
           ["stage", "Stage"],
           ["timing_scope", "Scope"],
           ["input_rows", "Rows"],
           ["gpu_backend", "GPU backend"],
           ["cpu_seconds", "CPU seconds"],
           ["gpu_seconds", "GPU seconds"],
-          ["speedup", "CPU/GPU speedup"],
+          ["time_ratio", "CPU time / GPU time"],
+          ["faster", "Faster backend"],
         ])
       : notice(
           "No matching validated CPU and GPU measurements are available in this selection.",
         );
     byId("trial-table").innerHTML = table(
-      rows,
+      rows.map((row) => ({ ...row, elapsed_s: number(row.elapsed_s, 6) })),
       [
         ["experiment_id", "Experiment"],
         ["repeat", "Repeat"],
@@ -962,6 +1099,10 @@ async function methods(request) {
     panel(
       "Interpretation and limitations",
       `<p>TLC data describes recorded taxi and ride-hailing activity, not all citywide travel demand. Zone connections do not reveal streets taken or intermediate passenger positions.</p><p>Pickups and drop-offs are independently timed. OD connections are anchored to pickup time. Missing coverage is not zero activity, and boundary drop-offs may have partial source coverage.</p><p>Timestamps use the declared New York source-local convention. Repeated and nonexistent daylight-saving hours cannot be treated as ordinary hourly observations.</p><p>KMeans labels describe groups in the selected feature space. Statistical alerts do not establish real-world incidents or causality. Synthetic tests measure response to constructed perturbations.</p><p>Map boundaries and source records: NYC Taxi and Limousine Commission. This project is not an official NYC service.</p>`,
+    ) +
+    panel(
+      "Implemented scope and remaining project work",
+      `<p>The system acquires TLC records, cleans and aggregates them, fits trip clusters, detects unusual pickup counts, and publishes maps, charts, data quality checks, and matched CPU/GPU timings. CUDA, cuDF, and cuML were exercised in a separate January GPU run; the six-month public results were built on the CPU.</p><p>The advanced cuGraph component is not implemented. Origin–destination lines are a visualization, not a graph algorithm. Anomalies currently cover pickup volume only; travel-duration anomalies and separate demand analysis remain to be built. Completed taxi trips are an indicator of recorded activity, not a direct measurement of unmet travel demand.</p><p>Performance experiments compare selected input sizes and operations. A matched CPU/GPU benchmark of all six months, broader scalability testing, and fuller resource measurements remain project work. The historical measurements are not evidence that every pipeline stage is GPU accelerated or faster.</p>${state.summary.meta.models?.clustering?.eligibility ? "<p>The revised clustering plausibility limits were chosen after inspecting full-period chart outliers, rather than optimized for a cluster-quality score. Revised May–June clustering results are a retrospective evaluation; an additional untouched period is needed for independent confirmation.</p>" : ""}`,
     ) +
     panel(
       "Frozen source records",

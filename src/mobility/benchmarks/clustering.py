@@ -24,6 +24,7 @@ from mobility.models.common import (
     HashSample,
     feature_matrix,
     in_period,
+    ml_filter_parameters,
     split_bounds,
     valid_ml_rows,
 )
@@ -39,9 +40,9 @@ PREDICTION_DISTANCE_ATOL = 1e-5
 def _prepare_inputs(frame: pd.DataFrame, config: dict):
     frame = frame.copy()
     frame["pickup_local"] = pd.to_datetime(frame["pickup_local"])
-    eligible = valid_ml_rows(frame)
-    bounds = split_bounds(config)
     parameters = config.get("clustering", {})
+    eligible = valid_ml_rows(frame, parameters)
+    bounds = split_bounds(config)
     options = config.get("benchmarks", config.get("benchmark", {}))
     seed = int(options.get("seed", 42))
     training = eligible.loc[in_period(eligible.pickup_local, bounds, "train")]
@@ -59,6 +60,7 @@ def _prepare_inputs(frame: pd.DataFrame, config: dict):
     initial, _ = kmeans_plusplus(train, n_clusters=k, random_state=seed)
     initial = np.ascontiguousarray(initial, dtype=np.float32)
     metadata = {
+        "eligibility_policy": ml_filter_parameters(parameters),
         "feature_names": FEATURE_NAMES,
         "feature_dtype": "float32",
         "training_rows_available": len(training),

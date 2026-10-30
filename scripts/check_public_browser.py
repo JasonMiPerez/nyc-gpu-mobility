@@ -34,6 +34,7 @@ def main():
         browser = playwright.chromium.launch()
         page = browser.new_page(viewport={"width": 1440, "height": 1000})
         errors, records = [], []
+        chart_checks = {}
         page.on("pageerror", lambda error: errors.append(str(error)))
         page.goto(args.url, wait_until="networkidle", timeout=60000)
         expect(page.locator("#page-content")).to_contain_text(f"{expected_all:,}", timeout=60000)
@@ -48,6 +49,43 @@ def main():
             content = page.locator("#page-content").inner_text()
             assert "could not be loaded" not in content.lower(), content
             assert len(content) > 20, content
+            if name == "patterns":
+                page.wait_for_function("document.getElementById('sample-scatter').data?.length > 0")
+                chart_checks["typical_axes"] = page.locator("#sample-scatter").evaluate(
+                    "node => ({x: node.layout.xaxis.range, y: node.layout.yaxis.range})"
+                )
+                assert chart_checks["typical_axes"] == {"x": [0, 50], "y": [0, 120]}
+                page.locator("#sample-view").select_option("full")
+                expect(page.locator("#sample-view-summary")).to_contain_text("5,000")
+                page.wait_for_function(
+                    "document.getElementById('sample-scatter').data.reduce((n, t) => n + t.x.length, 0) === 5000"
+                )
+                assert (
+                    page.locator("#sample-histogram").evaluate(
+                        "node => node.data[0].y.reduce((a, b) => a + b, 0)"
+                    )
+                    == 5000
+                )
+                page.locator("#sample-view").select_option("log")
+                page.wait_for_function(
+                    "document.getElementById('sample-scatter').layout.xaxis.title.text.includes('log')"
+                )
+                chart_checks["full_and_log_points"] = 5000
+                page.locator("#sample-view").select_option("typical")
+            elif name == "zones":
+                expect(page.locator("#od-limit")).to_have_value("50")
+                expect(page.locator("#od-summary")).to_contain_text("50")
+                page.locator("#od-limit").select_option("25")
+                expect(page.locator("#od-summary")).to_contain_text("25")
+                chart_checks["od_limit_control"] = True
+            elif name == "anomalies":
+                expect(page.locator("#page-content")).to_contain_text("Unreviewed")
+                expect(page.locator("#page-content")).to_contain_text("MAD")
+            elif name == "performance":
+                expect(page.locator("#speedup-table")).to_contain_text("CPU faster")
+                expect(page.locator("#speedup-table")).to_contain_text("0.004186")
+                expect(page.locator("#speedup-table")).to_contain_text("0.004763")
+                chart_checks["cpu_winner_and_precision"] = True
             records.append({"page": name, "elapsed_s": round(time.perf_counter() - started, 3)})
             page.screenshot(path=str(output / f"public-{name}.png"), full_page=True)
         page.locator('button[data-page="overview"]').click()
@@ -79,6 +117,7 @@ def main():
             "mobile_widths": widths,
             "filter_expected_pickups": expected_filtered,
             "csv_verified": True,
+            "chart_checks": chart_checks,
         }
         (output / "browser-public.json").write_text(json.dumps(report, indent=2))
         print(json.dumps(report, indent=2))

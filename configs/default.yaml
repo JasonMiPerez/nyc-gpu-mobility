@@ -20,6 +20,10 @@ clustering:
   k_values: [4, 6, 8]
   training_max_rows: 200000
   evaluation_max_rows: 2000
+  # Model-only study limits; raw data and pickup/drop-off counts are preserved.
+  max_distance_miles: 100
+  max_duration_minutes: 180
+  max_mean_speed_mph: 100
   seed: 42
 anomalies:
   min_history: 8

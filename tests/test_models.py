@@ -15,7 +15,14 @@ from mobility.models.anomalies import (
     score_anomalies,
 )
 from mobility.models.clustering import fit_clusters
-from mobility.models.common import HashSample, feature_matrix, split_bounds
+from mobility.models.common import (
+    HashSample,
+    feature_matrix,
+    ml_filter_parameters,
+    ml_row_masks,
+    split_bounds,
+    valid_ml_rows,
+)
 
 
 def hourly_frame(times, counts=100, coverage="observed"):
@@ -43,6 +50,10 @@ def trip_fixture():
         + list(pd.date_range("2024-04-04", periods=30, freq="h"))
         + list(pd.date_range("2024-05-04", periods=30, freq="h"))
     )
+    distances = rng.lognormal(1, 0.8, count)
+    # Keep the general modeling fixture within the fixed study bounds. Dedicated
+    # tests below exercise malformed and extreme records separately.
+    durations = np.maximum(rng.lognormal(6, 0.7, count), distances * 3600 / 60)
     return pd.DataFrame(
         {
             "record_id": [f"source:{i}" for i in range(count)],
@@ -50,8 +61,8 @@ def trip_fixture():
             "pickup_local": pickups,
             "pickup_zone_id": 1,
             "dropoff_zone_id": 2,
-            "trip_distance_miles": rng.lognormal(1, 0.8, count),
-            "duration_seconds": rng.lognormal(6, 0.7, count),
+            "trip_distance_miles": distances,
+            "duration_seconds": durations,
             "eligible_ml": True,
         }
     )
@@ -85,6 +96,59 @@ def test_hash_sample_does_not_depend_on_batch_order():
 def test_temporal_splits_reject_overlap():
     with pytest.raises(ValueError, match="overlap"):
         split_bounds({"splits": {"train_end": "2024-04-02"}})
+
+
+def test_ml_study_filters_keep_ordinary_zero_distance_and_boundary_trips():
+    frame = trip_fixture().iloc[:8].copy()
+    frame["trip_distance_miles"] = [3, 0, 100, 1, 100125.14, 5, 10, 400]
+    frame["duration_seconds"] = [900, 600, 3600, 10800, 780, 10801, 60, 12000]
+    original = frame.copy(deep=True)
+
+    masks = ml_row_masks(frame)
+    assert valid_ml_rows(frame)["record_id"].tolist() == frame["record_id"].iloc[:4].tolist()
+    assert masks["distance_exceeds_limit"].sum() == 2
+    assert masks["duration_exceeds_limit"].sum() == 2
+    assert masks["mean_speed_exceeds_limit"].sum() == 3
+    assert masks["invalid_features"].sum() == 0
+    assert masks["canonical_eligible"].sum() - masks["model_eligible"].sum() == 4
+    pd.testing.assert_frame_equal(frame, original)
+
+
+def test_ml_study_filter_overrides_are_applied_to_every_limit():
+    frame = trip_fixture().iloc[:1].copy()
+    frame["trip_distance_miles"] = 1000
+    frame["duration_seconds"] = 12000
+    assert valid_ml_rows(frame).empty
+    limits = {
+        "max_distance_miles": 1000,
+        "max_duration_minutes": 200,
+        "max_mean_speed_mph": 300,
+    }
+    assert len(valid_ml_rows(frame, limits)) == 1
+    for name in limits:
+        stricter = limits | {name: limits[name] / 2}
+        assert valid_ml_rows(frame, stricter).empty
+
+
+def test_ml_invalid_features_and_canonical_exclusions_remain_authoritative():
+    frame = trip_fixture().iloc[:7].copy()
+    frame["trip_distance_miles"] = [-1, np.nan, np.inf, 1, 1, 1, 100125.14]
+    frame["duration_seconds"] = [600, 600, 600, 0, np.inf, 600, 780]
+    frame.loc[frame.index[5], "pickup_local"] = pd.NaT
+    frame.loc[frame.index[6], "eligible_ml"] = False
+    masks = ml_row_masks(frame)
+    assert valid_ml_rows(frame).empty
+    assert masks["canonical_eligible"].sum() == 6
+    assert masks["invalid_features"].sum() == 6
+    # Rule counts concern the canonical-eligible population, not every raw row.
+    assert masks["distance_exceeds_limit"].sum() == 0
+    assert masks["mean_speed_exceeds_limit"].sum() == 0
+
+
+@pytest.mark.parametrize("limit", [0, -1, np.nan, np.inf])
+def test_ml_study_bounds_must_be_finite_and_positive(limit):
+    with pytest.raises(ValueError, match="finite and positive"):
+        ml_filter_parameters({"max_distance_miles": limit})
 
 
 def test_future_observations_cannot_change_seasonal_baseline():
@@ -187,7 +251,8 @@ def test_injection_evaluation_preserves_original_and_never_calls_background_fals
     pd.testing.assert_frame_equal(injections, again_rows)
 
 
-def test_clustering_scaler_and_selection_never_use_test_values(tmp_path):
+@pytest.mark.parametrize("future_values", [(80, 7200), (1e9, 1e9)])
+def test_clustering_scaler_and_selection_never_use_test_values(tmp_path, future_values):
     data = trip_fixture()
     source = tmp_path / "canonical"
     source.mkdir()
@@ -204,7 +269,7 @@ def test_clustering_scaler_and_selection_never_use_test_values(tmp_path):
         atol=1e-7,
     )
     test_mask = data["pickup_local"].ge(pd.Timestamp("2024-05-01"))
-    data.loc[test_mask, ["trip_distance_miles", "duration_seconds"]] = 1e9
+    data.loc[test_mask, ["trip_distance_miles", "duration_seconds"]] = future_values
     data.to_parquet(source / "part.parquet", index=False)
     second = fit_clusters(source, config, tmp_path / "second")
     second_parameters = json.loads((tmp_path / "second" / "cluster_parameters.json").read_text())
@@ -216,6 +281,77 @@ def test_clustering_scaler_and_selection_never_use_test_values(tmp_path):
     plotted = pd.read_parquet(tmp_path / "first" / "trip_plot_sample.parquet")
     assert len(plotted) == 10
     assert plotted["inclusion_fraction"].eq(10 / len(data)).all()
+
+
+def test_clustering_filters_all_splits_predictions_and_audits_overlapping_exclusions(tmp_path):
+    data = trip_fixture()
+    excluded = data.iloc[[0, 60, 90, 91, 92]].copy()
+    excluded["record_id"] = ["bad-train", "bad-calibration", "bad-test", "overlap", "canonical-out"]
+    excluded["trip_distance_miles"] = [100125.14, 5, 10, 400, 100125.14]
+    excluded["duration_seconds"] = [780, 10801, 60, 12000, 780]
+    excluded.loc[excluded.index[-1], "eligible_ml"] = False
+    source = tmp_path / "canonical"
+    source.mkdir()
+    original = pd.concat([data, excluded], ignore_index=True)
+    original.to_parquet(source / "part.parquet", index=False)
+    config = small_config()
+    config["dashboard"]["max_points"] = 5000
+    output = tmp_path / "models"
+    result = fit_clusters(source, config, output)
+
+    quality = result["metadata"]["eligibility"]
+    assert quality["canonical_rows"] == 125
+    assert quality["canonical_eligible_rows"] == 124
+    assert quality["model_eligible_rows"] == 120
+    assert quality["excluded_from_canonical_eligible_rows"] == 4
+    assert quality["excluded_by_rule"] == {
+        "invalid_features": 0,
+        "distance_exceeds_limit": 2,
+        "duration_exceeds_limit": 2,
+        "mean_speed_exceeds_limit": 3,
+    }
+    assert quality["model_eligible_fraction_of_canonical_rows"] == 120 / 125
+    assert quality["model_eligible_fraction_of_canonical_eligible_rows"] == 120 / 124
+    assert result["metadata"]["prediction_rows"] == 120
+    for period, expected_rows in [("train", 60), ("calibration", 30), ("test", 30)]:
+        assert result["metadata"]["samples"][period]["eligible_rows"] == expected_rows
+        sampled = pd.read_parquet(output / f"cluster_{period}_sample_ids.parquet")
+        assert not sampled["record_id"].isin(excluded["record_id"]).any()
+    assignments = pd.read_parquet(output / "trip_cluster_assignment.parquet")
+    plotted = pd.read_parquet(output / "trip_plot_sample.parquet")
+    assert set(assignments["record_id"]) == set(data["record_id"])
+    assert set(plotted["record_id"]) == set(data["record_id"])
+    summary = pd.read_parquet(output / "cluster_summary.parquet").set_index("cluster")
+    predicted = data.merge(assignments, on="record_id", validate="one_to_one")
+    expected = predicted.groupby("cluster").agg(
+        trip_count=("record_id", "size"),
+        mean_distance_miles=("trip_distance_miles", "mean"),
+        mean_duration_minutes=("duration_seconds", lambda values: values.mean() / 60),
+        sampled_median_distance_miles=("trip_distance_miles", "median"),
+        sampled_median_duration_minutes=("duration_seconds", lambda values: values.median() / 60),
+    )
+    pd.testing.assert_frame_equal(
+        summary[expected.columns], expected, check_dtype=False, check_index_type=False
+    )
+    pd.testing.assert_frame_equal(pd.read_parquet(source / "part.parquet"), original)
+
+
+def test_clustering_configured_filters_apply_to_training_and_predictions(tmp_path):
+    data = trip_fixture()
+    source = tmp_path / "canonical"
+    source.mkdir()
+    data.to_parquet(source / "part.parquet", index=False)
+    config = small_config()
+    config["clustering"]["max_distance_miles"] = 3
+    expected = valid_ml_rows(data, config["clustering"])
+    output = tmp_path / "models"
+    result = fit_clusters(source, config, output)
+    assignments = pd.read_parquet(output / "trip_cluster_assignment.parquet")
+    assert set(assignments["record_id"]) == set(expected["record_id"])
+    assert result["metadata"]["eligibility"]["thresholds"]["max_distance_miles"] == 3
+    train_ids = pd.read_parquet(output / "cluster_train_sample_ids.parquet")["record_id"]
+    expected_train = expected.loc[expected["pickup_local"].lt(pd.Timestamp("2024-04-01"))]
+    assert set(train_ids) == set(expected_train["record_id"])
 
 
 def test_clustering_without_calibration_is_marked_exploratory(tmp_path):
