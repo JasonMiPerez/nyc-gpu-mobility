@@ -1,5 +1,6 @@
 .git
 .venv
+.gpu-env
 .browsers
 data
 artifacts
@@ -8,3 +9,4 @@ public-preview
 **/__pycache__
 .pytest_cache
 .env
+.env.*

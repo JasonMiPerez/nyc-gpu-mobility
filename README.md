@@ -51,12 +51,27 @@ Public website: [NYC Mobility Observatory](https://nyc-mobility-observatory-jp.b
 It serves a compact interactive snapshot. The full Python app below supports
 additional hourly and date-specific origin–destination queries.
 
-## Open the local dashboard
+## Get the source
 
-On this Mac the environment and published results are already available:
+Clone the repository, then follow the CPU installation instructions below:
 
 ```bash
-cd /Users/jasonperez/Downloads/nyc-gpu-mobility
+git clone https://github.com/JasonMiPerez/nyc-gpu-mobility.git
+cd nyc-gpu-mobility
+```
+
+The repository includes the application, CUDA sources, tests, configuration,
+environment records, and project documentation. Raw trip data, generated analysis
+artifacts, installed environments, and generated website bundles are excluded
+from Git. A fresh checkout needs either the synthetic demo or a real-data pipeline
+run before it can serve a local dashboard. The public website above is already
+available without installing anything.
+
+## Open a prepared local dashboard
+
+From a project directory with its environment and published results available:
+
+```bash
 .venv/bin/python -m mobility dashboard
 ```
 
