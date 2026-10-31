@@ -6,7 +6,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
-data/
+# Downloaded datasets live at the root; src/mobility/data is application code.
+/data/
 artifacts/
 dist/
 build/
